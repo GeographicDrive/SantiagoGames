@@ -1,0 +1,9 @@
+{
+  "generatedAt": "2026-08-08T18:36:48.944Z",
+  "centerLon": -70.6506,
+  "centerLat": -33.4372,
+  "radiusMeters": 45000,
+  "tileSizeMeters": 2000,
+  "totalTiles": 1165,
+  "totalWays": 234202
+}

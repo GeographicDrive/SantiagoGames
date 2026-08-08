@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SantiagoGames — Selector</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+</head>
+<body>
+
+  <!--
+    NOTA DE DISEÑO:
+    Toda la UI de SantiagoGames debe ser profesional y minimalista.
+    Se utiliza un único color de fondo y un único color de contorno/acento
+    en toda la interfaz. Sin gradientes, sin ruido visual, sin decoración
+    innecesaria. Cada elemento cumple una sola función.
+
+    NOTA DE FLUJO:
+    Este es el único archivo HTML del proyecto (index.html) y NO debe
+    renombrarse. Al cargar la página se muestra SIEMPRE el selector de
+    juegos primero. La simulación 3D (CesiumJS) vive en el mismo documento
+    pero permanece oculta e inicializada solo cuando el usuario presiona
+    "Seleccionar" — nunca se ejecuta automáticamente al abrir la página.
+  -->
+
+  <!-- ============ PANTALLA 1: SELECTOR ============ -->
+  <div class="scene" id="selectorScreen">
+
+    <header class="brand">
+      <span class="brand__mark">SG</span>
+      <div class="brand__text">
+        <h1 class="brand__title">SantiagoGames</h1>
+        <p class="brand__sub">Selector de proyectos</p>
+      </div>
+    </header>
+
+    <main class="wheel-stage" aria-label="Selector de juegos">
+      <button class="nav-arrow nav-arrow--left" id="prevBtn" aria-label="Anterior">‹</button>
+
+      <div class="wheel" id="wheel"></div>
+
+      <button class="nav-arrow nav-arrow--right" id="nextBtn" aria-label="Siguiente">›</button>
+    </main>
+
+    <section class="detail" id="detail">
+      <div class="detail__index" id="detailIndex">01 / 13</div>
+      <h2 class="detail__title" id="detailTitle">—</h2>
+      <p class="detail__author" id="detailAuthor">—</p>
+      <p class="detail__desc" id="detailDesc">—</p>
+      <button class="detail__select" id="selectBtn">Seleccionar</button>
+    </section>
+
+    <footer class="foot">
+      <span>Usa las flechas o haz click en una tarjeta para rotar la rueda</span>
+    </footer>
+
+  </div>
+
+  <!-- ============ PANTALLA 2: SIMULACIÓN 3D (oculta hasta seleccionar) ============ -->
+  <div class="sim-screen" id="simScreen" hidden>
+    <div id="cesiumContainer"></div>
+
+    <!-- ============ PANTALLA DE CARGA: pipeline OSM + elevación + malla ============ -->
+    <div class="loading-overlay" id="loadingOverlay">
+      <div class="loading-panel">
+        <div class="loading-panel__title">GENERANDO TRAMO VIAL</div>
+        <ul class="loading-steps">
+          <li class="loading-step" id="stepTiles">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">3D Tiles fotorrealistas (Google)</span>
+          </li>
+          <li class="loading-step" id="stepOsm">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">Cargando calles desde archivo local (data/tiles/)</span>
+          </li>
+          <li class="loading-step" id="stepElevation">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">Muestreando elevación real (sampleHeight)</span>
+          </li>
+          <li class="loading-step" id="stepMesh">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">Generando malla procedural de carretera</span>
+          </li>
+          <li class="loading-step" id="stepSpawn">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">Posicionando Audi Quattro</span>
+          </li>
+        </ul>
+        <div class="loading-panel__note" id="loadingDetail">Iniciando… (streaming v2)</div>
+      </div>
+    </div>
+
+    <div class="hud">
+      <div class="hud__title" id="hudTitle">SANTIAGOGAMES</div>
+      <div class="hud__line">Spawn: 1988 Audi Quattro · -33.4721851, -70.7039520 · NNO (332.5°)</div>
+      <div class="hud__line" id="hudStatus">Cargando 3D Tiles…</div>
+    </div>
+
+    <div class="top-right-controls">
+      <button class="icon-btn" id="settingsBtn" aria-label="Configuración" title="Configuración">⚙</button>
+      <button class="back-link" id="backBtn">‹ Volver al selector</button>
+    </div>
+
+    <!-- ============ PANEL DE CONFIGURACIÓN (centralizado) ============ -->
+    <div class="settings-overlay" id="settingsOverlay" hidden>
+      <div class="settings-panel" role="dialog" aria-label="Configuración">
+        <div class="settings-panel__header">
+          <span>Configuración</span>
+          <button class="settings-panel__close" id="settingsCloseBtn" aria-label="Cerrar">×</button>
+        </div>
+
+        <div class="settings-panel__body">
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Screen Space Error</span>
+              <span class="settings-row__value" id="sseValue">16</span>
+            </div>
+            <input type="range" class="gd-slider" id="sseSlider" min="2" max="64" step="2" value="16">
+          </div>
+
+          <div class="settings-row settings-row--switch">
+            <span>Occlusion Culling</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="occlusionToggle" checked>
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="settings-row settings-row--switch">
+            <span>Depth Against Terrain</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="depthTerrainToggle" checked>
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Render Distance</span>
+              <span class="settings-row__value" id="renderDistanceValue">60000 m</span>
+            </div>
+            <input type="range" class="gd-slider" id="renderDistanceSlider" min="1000" max="60000" step="500" value="60000">
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script src="script.js?v=streaming2"></script>
+</body>
+</html>
