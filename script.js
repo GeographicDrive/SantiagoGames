@@ -224,6 +224,21 @@ function yieldToMain(){
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * sampleHeightMostDetailedSafe — envoltorio de scene.sampleHeightMostDetailed
+ * con timeout. Sin esto, si Cesium no logra cargar los tiles necesarios para
+ * las posiciones pedidas (p.ej. porque cullRequestsWhileMoving descarta esas
+ * solicitudes), la promesa original puede quedar colgada para siempre. Acá
+ * simplemente se resuelve con null pasado el timeout, para que quien llama
+ * pueda seguir (usando una altura de respaldo) en vez de trabarse.
+ */
+function sampleHeightMostDetailedSafe(positions, timeoutMs = 8000){
+  return Promise.race([
+    viewer.scene.sampleHeightMostDetailed(positions),
+    new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+  ]).catch(() => null);
+}
+
 /* ---- Proyección local plano-tangente (ENU aprox.) centrada en CENTER_LON/LAT.
    Válida para las distancias que maneja el streaming (cientos de metros a
    pocos km), evita tener que hacer trigonometría esférica completa en cada
@@ -492,23 +507,42 @@ async function sampleRoadElevations(roads){
     });
   });
 
-  for (let i = 0; i < flatCartographics.length; i += ROAD_SAMPLE_BATCH) {
-    const batch = flatCartographics.slice(i, i + ROAD_SAMPLE_BATCH);
-    const batchRefs = backrefs.slice(i, i + ROAD_SAMPLE_BATCH);
+  // sampleHeightMostDetailed necesita poder pedir tiles nuevos para las
+  // posiciones muestreadas. Si cullRequestsWhileMoving está activo (lo está
+  // por defecto vía applyGdOptimizations), Cesium puede descartar esas
+  // solicitudes indefinidamente y la promesa de sampleHeightMostDetailed
+  // nunca se resuelve — el loop se queda pegado para siempre en el primer
+  // lote. Lo desactivamos mientras dura el muestreo y lo restauramos al
+  // terminar (o si algo falla).
+  const prevCullRequestsWhileMoving = tileset?.cullRequestsWhileMoving;
+  if (tileset) tileset.cullRequestsWhileMoving = false;
 
-    const sampled = await viewer.scene.sampleHeightMostDetailed(batch);
+  try {
+    for (let i = 0; i < flatCartographics.length; i += ROAD_SAMPLE_BATCH) {
+      const batch = flatCartographics.slice(i, i + ROAD_SAMPLE_BATCH);
+      const batchRefs = backrefs.slice(i, i + ROAD_SAMPLE_BATCH);
 
-    (sampled || batch).forEach((carto, j) => {
-      const [ri, pi] = batchRefs[j];
-      roads[ri].heights[pi] = carto?.height ?? 0;
-    });
+      const sampled = await sampleHeightMostDetailedSafe(batch);
+      if (!sampled) {
+        // No se pudo resolver a tiempo (tiles no disponibles todavía, etc.):
+        // se sigue con altura 0 para ese lote en vez de trabar el streaming.
+        console.warn("Muestreo de elevación: lote sin resolver, se usa altura 0.");
+      }
 
-    setLoadingStep(
-      "stepElevation", "active",
-      `Muestreando elevación… ${Math.min(i + ROAD_SAMPLE_BATCH, flatCartographics.length)}/${flatCartographics.length} puntos`
-    );
+      (sampled || batch).forEach((carto, j) => {
+        const [ri, pi] = batchRefs[j];
+        roads[ri].heights[pi] = carto?.height ?? 0;
+      });
 
-    await yieldToMain();
+      setLoadingStep(
+        "stepElevation", "active",
+        `Muestreando elevación… ${Math.min(i + ROAD_SAMPLE_BATCH, flatCartographics.length)}/${flatCartographics.length} puntos`
+      );
+
+      await yieldToMain();
+    }
+  } finally {
+    if (tileset) tileset.cullRequestsWhileMoving = prevCullRequestsWhileMoving;
   }
 
   return roads;
@@ -924,7 +958,7 @@ async function sampleCarGroundHeight(){
   _carGroundSampleInFlight = true;
   try {
     const carto = Cesium.Cartographic.fromDegrees(carState.lng, carState.lat);
-    const sampled = await viewer.scene.sampleHeightMostDetailed([carto]);
+    const sampled = await sampleHeightMostDetailedSafe(carto ? [carto] : []);
     if (sampled && sampled[0] && isFinite(sampled[0].height)){
       _lastCarGroundHeight = sampled[0].height;
     }
@@ -981,13 +1015,11 @@ async function spawnAudiQuattro(){
   // flotando o enterrado.
   const carto = Cesium.Cartographic.fromDegrees(SPAWN_LON, SPAWN_LAT);
   let groundHeight = 0;
-  try {
-    const sampled = await viewer.scene.sampleHeightMostDetailed([carto]);
-    if (sampled && sampled[0] && isFinite(sampled[0].height)) {
-      groundHeight = sampled[0].height;
-    }
-  } catch (e) {
-    console.warn("No se pudo muestrear la altura del terreno en el spawn, usando 0.", e);
+  const sampled = await sampleHeightMostDetailedSafe([carto]);
+  if (sampled && sampled[0] && isFinite(sampled[0].height)) {
+    groundHeight = sampled[0].height;
+  } else {
+    console.warn("No se pudo muestrear la altura del terreno en el spawn, usando 0.");
   }
   _lastCarGroundHeight = groundHeight;
 
