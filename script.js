@@ -190,6 +190,10 @@ const ROAD_TILE_LOAD_MARGIN_TILES = 1;       // anillo de tiles vecinos (1 = gri
 const ROAD_STREAM_CHECK_INTERVAL_MS = 500;   // cada cuánto se revisa el tile actual del auto
 const ROAD_SAMPLE_BATCH = 250;        // nodos por tanda en sampleHeightMostDetailed
 const ROAD_SAMPLE_CONCURRENT_BATCHES = 6; // tandas en vuelo al mismo tiempo (el cuello de botella es red, no CPU)
+const ROAD_SAMPLE_STRIDE = 4; // Muestreo disperso: solo se pide 1 de cada N nodos y el resto
+                               // se interpola linealmente entre los muestreados (splines simples
+                               // de tramo recto). Corta ~75% de los requests de red sin
+                               // notarse visualmente, porque los nodos de OSM ya son densos.
 const ROAD_SURFACE_OFFSET = 0.15; // metros sobre el terreno, evita z-fighting
 
 // Ancho aproximado (m) por tipo de vía OSM.
@@ -500,12 +504,29 @@ async function sampleRoadElevations(roads){
   const flatCartographics = [];
   const backrefs = []; // [roadIndex, pointIndex]
 
+  // Muestreo disperso: por cada vía se piden solo los nodos 0, STRIDE,
+  // 2*STRIDE, ... y siempre el último (para no cortar la punta). El resto
+  // de los nodos intermedios se interpola linealmente entre los dos nodos
+  // muestreados más cercanos — funciona muy bien acá porque los nodos de
+  // OSM ya vienen densos (varios metros entre sí), así que un tramo de
+  // pocos nodos es prácticamente recto.
   roads.forEach((road, ri) => {
-    road.heights = new Array(road.coordinates.length).fill(0);
-    road.coordinates.forEach((coord, pi) => {
+    const n = road.coordinates.length;
+    road.heights = new Array(n).fill(0);
+    road._sampledIdx = []; // índices con altura real (no interpolada)
+
+    for (let pi = 0; pi < n; pi += ROAD_SAMPLE_STRIDE){
+      const coord = road.coordinates[pi];
       flatCartographics.push(Cesium.Cartographic.fromDegrees(coord.lon, coord.lat));
       backrefs.push([ri, pi]);
-    });
+      road._sampledIdx.push(pi);
+    }
+    if (road._sampledIdx[road._sampledIdx.length - 1] !== n - 1){
+      const coord = road.coordinates[n - 1];
+      flatCartographics.push(Cesium.Cartographic.fromDegrees(coord.lon, coord.lat));
+      backrefs.push([ri, n - 1]);
+      road._sampledIdx.push(n - 1);
+    }
   });
 
   // sampleHeightMostDetailed necesita poder pedir tiles nuevos para las
@@ -558,7 +579,7 @@ async function sampleRoadElevations(roads){
     completed += batch.length;
     setLoadingStep(
       "stepElevation", "active",
-      `Muestreando elevación… ${Math.min(completed, total)}/${total} puntos`
+      `Muestreando elevación… ${Math.min(completed, total)}/${total} puntos (grilla dispersa 1/${ROAD_SAMPLE_STRIDE})`
     );
   }
 
@@ -583,6 +604,23 @@ async function sampleRoadElevations(roads){
     RS.maximumRequests = prevMaxRequests;
     RS.maximumRequestsPerServer = prevMaxRequestsPerServer;
   }
+
+  // Interpola linealmente los nodos que no se muestrearon directamente,
+  // usando los dos nodos muestreados más cercanos a cada lado (tramo
+  // "spline" recto entre alturas reales).
+  roads.forEach((road) => {
+    const idx = road._sampledIdx;
+    for (let s = 0; s < idx.length - 1; s++){
+      const a = idx[s], b = idx[s + 1];
+      if (b - a <= 1) continue;
+      const ha = road.heights[a], hb = road.heights[b];
+      for (let pi = a + 1; pi < b; pi++){
+        const t = (pi - a) / (b - a);
+        road.heights[pi] = ha + (hb - ha) * t;
+      }
+    }
+    delete road._sampledIdx;
+  });
 
   return roads;
 }
@@ -798,10 +836,11 @@ function stopRoadStreaming(){
 }
 
 /**
- * generateInitialRoadPatch — carga la grilla 3×3 de tiles alrededor del
- * punto de spawn ANTES de ocultar la pantalla de carga (para que el auto
- * aparezca con calles ya dibujadas debajo), y luego deja andando el
- * watcher de tiles para el resto del recorrido.
+ * generateInitialRoadPatch — carga SOLO el tile central (el que está bajo
+ * el spawn) antes de ocultar la pantalla de carga, para que el auto
+ * aparezca de inmediato con calle debajo. Los otros 8 tiles de la grilla
+ * 3×3 se encolan pero se cargan en SEGUNDO PLANO, sin bloquear el arranque
+ * — igual que ya hace updateRoadStreaming() cuando el auto se mueve.
  */
 async function generateInitialRoadPatch(spawnLon, spawnLat){
   try {
@@ -811,20 +850,20 @@ async function generateInitialRoadPatch(spawnLon, spawnLat){
     lastStreamCarTx = carTx;
     lastStreamCarTy = carTy;
 
+    const centerKey = tileKeyFor(carTx, carTy);
+    const backgroundKeys = [];
+
     for (const key of initialKeys){
       const [tx, ty] = key.split("_").map(Number);
       roadTiles.set(key, { tx, ty, status: "queued", entities: [], roads: null });
+      if (key !== centerKey) backgroundKeys.push(key);
     }
 
-    // Los ROAD_SAMPLE_BATCH puntos por tanda ya ceden el hilo principal
-    // (yieldToMain), así que cargar los tiles iniciales en paralelo no
-    // bloquea la interfaz — y hace que el parche inicial aparezca más rápido.
-    let totalWays = 0;
-    await Promise.all(initialKeys.map(async (key) => {
-      await loadRoadTile(key);
-      const tile = roadTiles.get(key);
-      if (tile) totalWays += tile.roads?.length ?? 0;
-    }));
+    // Solo se espera el tile central: es el único imprescindible para que
+    // el auto no aparezca "flotando" sobre nada al arrancar.
+    await loadRoadTile(centerKey);
+    const centerTile = roadTiles.get(centerKey);
+    const totalWays = centerTile?.roads?.length ?? 0;
 
     if (totalWays === 0) {
       console.warn(
@@ -834,9 +873,15 @@ async function generateInitialRoadPatch(spawnLon, spawnLat){
       );
     }
 
-    markStepDone("stepOsm", `${totalWays} vías cargadas desde archivos locales (grilla 3×3 sobre el spawn).`);
-    markStepDone("stepElevation", "Elevación real aplicada a cada tramo.");
+    markStepDone("stepOsm", `${totalWays} vías cargadas (tile central) — resto de la grilla 3×3 sigue en segundo plano.`);
+    markStepDone("stepElevation", "Elevación real aplicada al tramo central.");
     markStepDone("stepMesh", `Malla procedural generada para ${totalWays} tramos.`);
+
+    // El resto de la grilla (8 tiles) se genera después, sin bloquear:
+    // no se espera este Promise.all antes de ocultar el loading.
+    Promise.all(backgroundKeys.map((key) => loadRoadTile(key)))
+      .then(() => updateHudStreamingStatus())
+      .catch((err) => console.warn("Error cargando tiles de fondo de la grilla inicial:", err));
 
     startRoadStreaming();
   } catch (error) {
