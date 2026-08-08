@@ -188,7 +188,8 @@ let audiEntity = null;
 const ROAD_WORLD_RADIUS_METERS = 45000;      // límite máximo del mundo/mapa
 const ROAD_TILE_LOAD_MARGIN_TILES = 1;       // anillo de tiles vecinos (1 = grilla 3×3)
 const ROAD_STREAM_CHECK_INTERVAL_MS = 500;   // cada cuánto se revisa el tile actual del auto
-const ROAD_SAMPLE_BATCH = 60;   // nodos por tanda en sampleHeightMostDetailed
+const ROAD_SAMPLE_BATCH = 250;        // nodos por tanda en sampleHeightMostDetailed
+const ROAD_SAMPLE_CONCURRENT_BATCHES = 6; // tandas en vuelo al mismo tiempo (el cuello de botella es red, no CPU)
 const ROAD_SURFACE_OFFSET = 0.15; // metros sobre el terreno, evita z-fighting
 
 // Ancho aproximado (m) por tipo de vía OSM.
@@ -517,32 +518,70 @@ async function sampleRoadElevations(roads){
   const prevCullRequestsWhileMoving = tileset?.cullRequestsWhileMoving;
   if (tileset) tileset.cullRequestsWhileMoving = false;
 
-  try {
-    for (let i = 0; i < flatCartographics.length; i += ROAD_SAMPLE_BATCH) {
-      const batch = flatCartographics.slice(i, i + ROAD_SAMPLE_BATCH);
-      const batchRefs = backrefs.slice(i, i + ROAD_SAMPLE_BATCH);
+  // El cuello de botella real es de RED: por defecto Cesium solo permite
+  // ~6 requests simultáneos por servidor (RequestScheduler), así que pedir
+  // tandas una por una (secuencial) deja la mayoría de la conexión ociosa.
+  // Subimos esos topes temporalmente y disparamos varias tandas EN PARALELO
+  // (no una a la vez), y las restauramos al terminar.
+  const RS = Cesium.RequestScheduler;
+  const prevMaxRequests = RS.maximumRequests;
+  const prevMaxRequestsPerServer = RS.maximumRequestsPerServer;
+  RS.maximumRequests = Math.max(prevMaxRequests, 200);
+  RS.maximumRequestsPerServer = Math.max(prevMaxRequestsPerServer, 24);
 
-      const sampled = await sampleHeightMostDetailedSafe(batch);
-      if (!sampled) {
-        // No se pudo resolver a tiempo (tiles no disponibles todavía, etc.):
-        // se sigue con altura 0 para ese lote en vez de trabar el streaming.
-        console.warn("Muestreo de elevación: lote sin resolver, se usa altura 0.");
-      }
+  // Durante el muestreo no necesitamos el tileset visible en máxima calidad:
+  // subir el SSE de forma temporal hace que se resuelvan tiles más gruesos
+  // (más rápido) mientras se calcula la altura de las vías. Se restaura al
+  // terminar.
+  const prevMaxSSE = tileset?.maximumScreenSpaceError;
+  if (tileset) tileset.maximumScreenSpaceError = Math.max(prevMaxSSE ?? 16, 32);
 
-      (sampled || batch).forEach((carto, j) => {
-        const [ri, pi] = batchRefs[j];
-        roads[ri].heights[pi] = carto?.height ?? 0;
-      });
+  let completed = 0;
+  const total = flatCartographics.length;
 
-      setLoadingStep(
-        "stepElevation", "active",
-        `Muestreando elevación… ${Math.min(i + ROAD_SAMPLE_BATCH, flatCartographics.length)}/${flatCartographics.length} puntos`
-      );
+  async function runBatch(start){
+    const batch = flatCartographics.slice(start, start + ROAD_SAMPLE_BATCH);
+    const batchRefs = backrefs.slice(start, start + ROAD_SAMPLE_BATCH);
 
-      await yieldToMain();
+    const sampled = await sampleHeightMostDetailedSafe(batch);
+    if (!sampled) {
+      // No se pudo resolver a tiempo (tiles no disponibles todavía, etc.):
+      // se sigue con altura 0 para ese lote en vez de trabar el streaming.
+      console.warn("Muestreo de elevación: lote sin resolver, se usa altura 0.");
     }
+
+    (sampled || batch).forEach((carto, j) => {
+      const [ri, pi] = batchRefs[j];
+      roads[ri].heights[pi] = carto?.height ?? 0;
+    });
+
+    completed += batch.length;
+    setLoadingStep(
+      "stepElevation", "active",
+      `Muestreando elevación… ${Math.min(completed, total)}/${total} puntos`
+    );
+  }
+
+  try {
+    // Cola de tandas: se mantienen ROAD_SAMPLE_CONCURRENT_BATCHES en vuelo
+    // en todo momento; apenas una termina, se lanza la siguiente.
+    let nextStart = 0;
+    const worker = async () => {
+      while (nextStart < total) {
+        const start = nextStart;
+        nextStart += ROAD_SAMPLE_BATCH;
+        await runBatch(start);
+        await yieldToMain();
+      }
+    };
+    const workers = [];
+    for (let w = 0; w < ROAD_SAMPLE_CONCURRENT_BATCHES; w++) workers.push(worker());
+    await Promise.all(workers);
   } finally {
     if (tileset) tileset.cullRequestsWhileMoving = prevCullRequestsWhileMoving;
+    if (tileset) tileset.maximumScreenSpaceError = prevMaxSSE ?? tileset.maximumScreenSpaceError;
+    RS.maximumRequests = prevMaxRequests;
+    RS.maximumRequestsPerServer = prevMaxRequestsPerServer;
   }
 
   return roads;
