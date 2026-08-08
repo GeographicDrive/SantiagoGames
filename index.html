@@ -7,6 +7,8 @@
 <link rel="stylesheet" href="style.css">
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Cesium.js"></script>
 <link href="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
 
@@ -145,8 +147,68 @@
             <input type="range" class="gd-slider" id="renderDistanceSlider" min="1000" max="60000" step="500" value="60000">
           </div>
 
+          <div class="settings-row settings-row--switch">
+            <span>Dynamic Screen Space Error</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="dynamicSseToggle" checked>
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="settings-row" id="dynamicSseDensityRow">
+            <div class="settings-row__label">
+              <span>Dynamic SSE Density</span>
+              <span class="settings-row__value" id="dynamicSseDensityValue">0.00278</span>
+            </div>
+            <input type="range" class="gd-slider" id="dynamicSseDensitySlider" min="0.0005" max="0.02" step="0.0005" value="0.00278">
+          </div>
+
         </div>
       </div>
+    </div>
+
+    <!-- ============ NAVEGACIÓN: BUSCADOR + MINIMAPA (portado de GeoDrive) ============ -->
+    <div id="navSearchBar">
+      <input type="text" id="navSearchInput" placeholder="Buscar dirección o lugar…" autocomplete="off">
+      <button id="navSearchBtn" title="Buscar">🔍</button>
+    </div>
+
+    <div id="navMinimapOverlay">
+      <div id="navMinimapHeader">
+        <span id="navMinimapTitle">🗺️ Navegación</span>
+        <span id="navMinimapDistWrap">—</span>
+        <button id="navMinimapBtnMin" title="Minimizar">–</button>
+      </div>
+      <div id="navMinimapViewport">
+        <div id="navMinimap"></div>
+        <div id="navMinimapResizeHandle" title="Redimensionar"><svg viewBox="0 0 14 14"><path d="M14 0L0 14M14 6L6 14M14 12L12 14" stroke="#E8B93A" stroke-width="1.4"/></svg></div>
+        <div id="navMinimapVehicle">
+          <svg viewBox="0 0 20 28" width="20" height="28">
+            <polygon points="10,0 20,26 10,20 0,26" fill="#E8B93A" stroke="#121210" stroke-width="1.5" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div id="navMinimapNorth">N</div>
+      </div>
+      <div id="navMinimapFooter">
+        <span id="navMinimapDestLabel">Sin destino</span>
+        <div id="navMinimapZoomBtns">
+          <button id="navZoomIn">+</button>
+          <button id="navZoomOut">−</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ CONTROLES DE CONDUCCIÓN (portado de GeoDrive, modo Ground Vehicle) ============ -->
+    <div id="drivingControls">
+      <div id="dpadContainer" class="steering-module">
+        <div class="d-pad-btn" id="btnLeft">‹</div>
+        <div class="d-pad-btn" id="btnRight">›</div>
+      </div>
+      <div class="pedal-container" id="pedalWrapper">
+        <div class="pedal pedal-brake" id="btnBrake">FRENO</div>
+        <div class="pedal pedal-gas" id="btnGas">GAS</div>
+      </div>
+      <div id="speedReadout"><span id="speedValue">0</span><span class="speed-unit">km/h</span></div>
     </div>
   </div>
 

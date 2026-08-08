@@ -168,25 +168,28 @@ let audiEntity = null;
 // significa que se descarguen/generen las calles de todo ese radio de
 // una sola vez en el navegador. El archivo local (data/tiles/) SÍ cubre
 // los 45 km completos (se generó una sola vez, offline), pero el cliente
-// solo va pidiendo/renderizando de a un área de streaming por vez.
+// solo mantiene construida la malla de las vías de los tiles cercanos al
+// auto.
 //
-// STREAMING DINÁMICO POR CHUNKS.
-//   - El mapa/mundo sigue limitado a ROAD_WORLD_RADIUS_METERS (45 km):
-//     nunca se pide/genera nada más allá de ese radio desde el centro.
-//   - Alrededor del auto solo se mantiene cargado un área de
-//     ROAD_LOAD_RADIUS_METERS (300 m).
-//   - Se usa histéresis: un chunk se descarga recién cuando queda a más
-//     de ROAD_UNLOAD_RADIUS_METERS (400-450 m) del auto, para no estar
-//     generando/eliminando constantemente cuando el auto ronda el borde.
-const ROAD_WORLD_RADIUS_METERS = 45000;   // límite máximo del mundo/mapa
-const ROAD_LOAD_RADIUS_METERS = 300;      // radio de generación activa alrededor del auto
-const ROAD_UNLOAD_RADIUS_METERS = 425;    // histéresis: se descarga más allá de esto
-const ROAD_CHUNK_SIZE_METERS = 150;       // tamaño de celda de la grilla de streaming
-const ROAD_STREAM_MOVE_THRESHOLD = 25;    // metros que debe moverse el auto para reevaluar
-const ROAD_STREAM_CHECK_INTERVAL_MS = 350; // cada cuánto se revisa la posición del auto
+// CARGA POR TILE (reemplaza el viejo streaming por grillas finas de 150 m).
+// Como los datos ya son archivos estáticos locales (no Overpass en vivo),
+// no hace falta trocear cada tile de 2 km en decenas de "chunks" con cola
+// y descarga con histéresis: alcanza con cargar/descargar el tile de
+// 2×2 km completo (mismo tamaño que ya generó scripts/fetch-roads.mjs) al
+// que pertenece el auto, más un anillo de tiles vecinos alrededor.
+//   - El mapa/mundo sigue limitado a ROAD_WORLD_RADIUS_METERS (45 km).
+//   - Se mantienen cargados los tiles a ROAD_TILE_LOAD_MARGIN_TILES de
+//     distancia (en la grilla) del tile donde está el auto — con margen 1
+//     eso es una grilla de 3×3 tiles (~6×6 km) siempre alrededor del auto.
+//   - Un tile se descarga (se sacan sus entidades de la escena) apenas deja
+//     de estar en esa grilla 3×3; sus vías ya elevadas quedan en memoria
+//     (roadTiles) por si el auto vuelve, así no hay que re-pedir el archivo
+//     ni re-muestrear elevación.
+const ROAD_WORLD_RADIUS_METERS = 45000;      // límite máximo del mundo/mapa
+const ROAD_TILE_LOAD_MARGIN_TILES = 1;       // anillo de tiles vecinos (1 = grilla 3×3)
+const ROAD_STREAM_CHECK_INTERVAL_MS = 500;   // cada cuánto se revisa el tile actual del auto
 const ROAD_SAMPLE_BATCH = 60;   // nodos por tanda en sampleHeightMostDetailed
 const ROAD_SURFACE_OFFSET = 0.15; // metros sobre el terreno, evita z-fighting
-const ROAD_MAX_CHUNK_LOADS_PER_TICK = 1; // cuántos chunks se procesan por pasada de la cola
 
 // Ancho aproximado (m) por tipo de vía OSM.
 const ROAD_WIDTH_BY_TYPE = {
@@ -196,32 +199,23 @@ const ROAD_WIDTH_BY_TYPE = {
 };
 const ROAD_WIDTH_DEFAULT = 6;
 
-/* ---- Estado del sistema de streaming de calles (chunks alrededor del auto) ----
-   roadChunks         : Map(chunkKey -> { cx, cy, centerLon, centerLat, status,
-                                           entities:[], wayIds:Set }) — chunks
-                         actualmente registrados (cargados, cargando o en cola).
-   roadChunkDataCache  : Map(chunkKey -> roadsWithHeights[]) — caché en memoria
-                         de las vías YA elevadas, sobrevive al descargar el
-                         chunk, para no volver a muestrear elevación si el
-                         auto regresa a esa zona.
-   roadEntityByWay     : Map(wayId -> entity) — reutilización/eliminación de
-                         la geometría ya generada para esa vía.
-   roadLoadQueue       : chunkKeys pendientes de generar, en orden de cercanía
-                         al auto.
-   roadQueueSet        : Set espejo de roadLoadQueue, para evitar encolar el
-                         mismo chunk dos veces.
+/* ---- Estado del sistema de carga de calles por tile ----
+   roadTiles      : Map(tileKey -> { tx, ty, status, entities:[], roads:[] })
+                    — un registro por tile de 2×2 km. `roads` guarda las
+                    vías YA elevadas (sobrevive a la descarga del tile, para
+                    no re-pedir el archivo ni re-muestrear elevación si el
+                    auto vuelve a esa zona). `entities` son las que están
+                    actualmente puestas en la escena (vacío si el tile está
+                    descargado pero sigue en caché).
+   roadEntityByWay: Map(wayId -> entity) — evita duplicar geometría.
 */
-let roadChunks = new Map();
-let roadChunkDataCache = new Map();
+let roadTiles = new Map();
 let roadEntityByWay = new Map();
-let roadLoadQueue = [];
-let roadQueueSet = new Set();
-let isProcessingRoadQueue = false;
 let roadStreamingActive = false;
 let roadStreamTimerId = null;
-let lastStreamCarX = null;
-let lastStreamCarY = null;
-let roadStreamStats = { loaded: 0, queued: 0 };
+let lastStreamCarTx = null;
+let lastStreamCarTy = null;
+let roadStreamStats = { loaded: 0, loading: 0 };
 
 // Mantenido por compatibilidad con el resto del código (p.ej. limpieza total).
 let roadEntities = [];
@@ -251,22 +245,9 @@ function localXYToLonLat(x, y){
   return { lon, lat };
 }
 
-function chunkCoordsForLonLat(lon, lat){
+function tileCoordsForLonLat(lon, lat){
   const { x, y } = lonLatToLocalXY(lon, lat);
-  return {
-    cx: Math.floor(x / ROAD_CHUNK_SIZE_METERS),
-    cy: Math.floor(y / ROAD_CHUNK_SIZE_METERS),
-  };
-}
-
-function chunkKeyFor(cx, cy){
-  return `${cx}_${cy}`;
-}
-
-function chunkCenterLonLat(cx, cy){
-  const x = cx * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-  const y = cy * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-  return localXYToLonLat(x, y);
+  return tileCoordsForXY(x, y);
 }
 
 const hudTitle = document.getElementById("hudTitle");
@@ -324,13 +305,13 @@ const gdSettings = {
   renderDistance: 60000,    // GeoDrive: gp3dtRenderDistance (metros) — alto por
                              // defecto para no ocultar el tileset durante la
                              // vista panorámica inicial (cámara a 60 km de altura)
+  dynamicScreenSpaceError: true,        // GeoDrive: mismo toggle del panel de Configuración
+  dynamicScreenSpaceErrorDensity: 0.00278, // GeoDrive: mismo slider del panel de Configuración
 };
 
 // Optimizaciones automáticas de GeoDrive que permanecen SIEMPRE activas,
 // sin exponerse en la UI (el usuario no necesita tocarlas manualmente).
 const GD_AUTO_OPTIMIZATIONS = {
-  dynamicScreenSpaceError: true,
-  dynamicScreenSpaceErrorDensity: 0.00278,
   skipLevelOfDetail: true,
   baseScreenSpaceError: 1024,
   skipScreenSpaceErrorFactor: 16,
@@ -384,8 +365,8 @@ async function initSimulation(gameName){
     // Ya está montado, no se vuelve a inicializar Cesium — solo se
     // reactiva el streaming de calles (se había detenido al volver al
     // selector) para que siga siguiendo al auto automáticamente.
-    lastStreamCarX = null;
-    lastStreamCarY = null;
+    lastStreamCarTx = null;
+    lastStreamCarTy = null;
     startRoadStreaming();
     updateHudStreamingStatus();
     return;
@@ -456,42 +437,26 @@ async function initSimulation(gameName){
 /**
  * ======================================================================
  * FUENTE DE DATOS VIALES: ARCHIVO PRECOMPUTADO POR TILES (ya NO Overpass
- * en tiempo real).
+ * en tiempo real, y ya NO streaming por grillas finas de 150 m).
  * ======================================================================
  *
- * Antes, cada chunk de streaming (150 m) golpeaba la API de Overpass en
- * el momento en que el auto se acercaba — eso es lo que causaba las
- * esperas erráticas / cuelgues. Ahora TODAS las calles dentro de los
- * 45 km del mundo se descargan UNA sola vez, offline, con el script
- * `scripts/fetch-roads.mjs` (ver ese archivo e INSTRUCCIONES.md), y
- * quedan guardadas como archivos estáticos JSON en `data/tiles/`,
- * particionados en una grilla de ROAD_TILE_SIZE_METERS (2 km) por lado.
- * Este valor DEBE coincidir con --tile-size en scripts/fetch-roads.mjs
- * (mismo default: 2000 m) — si cambiás uno, cambiá el otro.
+ * Antes había dos capas de streaming: Overpass en vivo (ya eliminado) y,
+ * encima, un troceo fino de cada tile en decenas de "chunks" de 150 m con
+ * cola propia e histéresis de descarga. Esa segunda capa tenía sentido
+ * cuando los datos podían tardar en llegar por red; ahora que son
+ * archivos JSON locales, agrega complejidad sin beneficio real. La unidad
+ * de carga/descarga pasa a ser directamente el TILE (2×2 km, el mismo que
+ * generó scripts/fetch-roads.mjs) — se carga un archivo, se eleva y se
+ * construye su malla completa de una vez.
  *
- * En tiempo de ejecución, el streaming de 300 m alrededor del auto NO
- * llama a ninguna API externa: solo hace fetch() de esos archivos
- * estáticos locales (mismo dominio, sin límites de tasa, sin timeouts de
- * Overpass, sin bloqueos). Cada tile trae ~4 km² de calles ya
- * resueltas (id, tipo, nombre, coordenadas), y de ahí el streaming solo
- * agrupa/filtra en memoria por chunk de 150 m — muy barato.
- *
- * La única llamada de red que sigue ocurriendo por chunk es el muestreo
- * de ELEVACIÓN real (Cesium sampleHeightMostDetailed contra los 3D
- * Tiles), porque la altura del terreno no se puede precomputar sin
- * levantar Cesium — pero esa llamada es rápida y no depende de Overpass.
- *
- * roadTileCache      : Map(tileKey -> "loaded" | Promise<void>) — evita
- *                       pedir el mismo archivo de tile dos veces.
- * chunkRawDataCache   : Map(chunkKey -> roads[] SIN alturas) — se llena
- *                       al procesar un tile (un tile de 2 km llena ~180 chunks de
- *                       una sola vez).
+ * roadTileCache : Map(tileKey -> "loaded" | Promise<void>) — evita pedir
+ *                 el mismo archivo de tile dos veces mientras está en
+ *                 vuelo.
  */
-const ROAD_TILE_SIZE_METERS = 2000;
+const ROAD_TILE_SIZE_METERS = 2000; // DEBE coincidir con --tile-size en scripts/fetch-roads.mjs
 const ROAD_TILES_BASE_URL = "data/tiles/"; // relativo a index.html
 
-let roadTileCache = new Map();       // tileKey -> "loaded" | Promise
-let chunkRawDataCache = new Map();   // chunkKey -> roads[] (sin alturas todavía)
+let roadTileCache = new Map(); // tileKey -> "loaded" | Promise
 
 function tileCoordsForXY(x, y){
   return {
@@ -504,76 +469,16 @@ function tileKeyFor(tx, ty){
   return `${tx}_${ty}`;
 }
 
-function tileKeyForChunk(cx, cy){
-  // Usamos el CENTRO del chunk (mismo criterio que usó el script offline
-  // al asignar cada vía a un tile por su primer nodo) para saber qué
-  // archivo de tile hay que pedir para llenar este chunk.
-  const x = cx * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-  const y = cy * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-  const { tx, ty } = tileCoordsForXY(x, y);
-  return tileKeyFor(tx, ty);
-}
-
-/**
- * ensureTileLoaded — descarga (si no está en caché) el archivo estático
- * de un tile y reparte sus vías entre los chunks de 150 m que le
- * corresponden (chunkRawDataCache). Un 404 (tile sin calles — p.ej. un
- * cerro, un parque grande, o directamente fuera de lo generado) se trata
- * como "sin datos", NUNCA como error que bloquee el streaming.
- */
-function ensureTileLoaded(tileKey){
-  const cached = roadTileCache.get(tileKey);
-  if (cached === "loaded") return Promise.resolve();
-  if (cached instanceof Promise) return cached;
-
-  const promise = (async () => {
-    let roads = [];
-    try {
-      const response = await fetch(`${ROAD_TILES_BASE_URL}${tileKey}.json`);
-      if (response.ok) {
-        roads = await response.json();
-      } else if (response.status !== 404) {
-        console.warn(`Tile ${tileKey}: respuesta ${response.status} al pedirlo (se trata como vacío).`);
-      }
-    } catch (error) {
-      // Sin conexión momentánea, etc. — no bloquea el streaming, ese
-      // tile simplemente queda sin calles hasta el próximo intento
-      // (se reintentará solo si el chunk se vuelve a pedir más tarde,
-      // porque acá NO marcamos el tile como "loaded").
-      console.warn(`No se pudo cargar el tile ${tileKey}:`, error);
-      roadTileCache.delete(tileKey);
-      return;
-    }
-
-    for (const road of roads){
-      if (!road.coordinates || road.coordinates.length < 2) continue;
-      const [firstLon, firstLat] = road.coordinates[0];
-      const { cx, cy } = chunkCoordsForLonLat(firstLon, firstLat);
-      const chunkKey = chunkKeyFor(cx, cy);
-      if (!chunkRawDataCache.has(chunkKey)) chunkRawDataCache.set(chunkKey, []);
-      chunkRawDataCache.get(chunkKey).push({
-        id: road.id,
-        highwayType: road.highwayType,
-        name: road.name || null,
-        coordinates: road.coordinates.map(([lon, lat]) => ({ lon, lat })),
-      });
-    }
-
-    roadTileCache.set(tileKey, "loaded");
-  })();
-
-  roadTileCache.set(tileKey, promise);
-  return promise;
+function tileCenterLonLat(tx, ty){
+  const x = tx * ROAD_TILE_SIZE_METERS + ROAD_TILE_SIZE_METERS / 2;
+  const y = ty * ROAD_TILE_SIZE_METERS + ROAD_TILE_SIZE_METERS / 2;
+  return localXYToLonLat(x, y);
 }
 
 /**
  * sampleRoadElevations — cruza cada nodo de cada vía con la altimetría
  * real de los 3D Tiles (sampleHeightMostDetailed), en tandas de
- * ROAD_SAMPLE_BATCH puntos para no bloquear el hilo principal. El
- * progreso mostrado ("N/total puntos") es sobre el conjunto COMPLETO que
- * se le pase — por eso siempre se le pasa de una sola vez toda el área
- * que se está cargando en ese momento, nunca en llamadas separadas por
- * chunkcito, así la barra avanza de forma continua y realmente converge.
+ * ROAD_SAMPLE_BATCH puntos para no bloquear el hilo principal.
  */
 async function sampleRoadElevations(roads){
   const flatCartographics = [];
@@ -610,21 +515,17 @@ async function sampleRoadElevations(roads){
 }
 
 /**
- * buildRoadMeshesForChunk — con las alturas ya calculadas, genera la malla
- * "corridor" de cada vía y la agrega tanto al chunk (para poder
- * descargarla después) como al registro global roadEntityByWay
- * (reutilizado para no duplicar geometría). Si una vía ya tiene entidad,
- * se reutiliza en vez de crear una nueva.
+ * buildRoadMeshesForTile — con las alturas ya calculadas, genera la malla
+ * "corridor" de cada vía del tile y la agrega tanto al registro del tile
+ * (para poder descargarla después) como al índice global roadEntityByWay
+ * (reutilizado para no duplicar geometría si el tile se recarga).
  */
-function buildRoadMeshesForChunk(chunk, roads){
-  const entities = [];
-
+function buildRoadMeshesForTile(tile, roads){
   roads.forEach((road) => {
     if (road.coordinates.length < 2) return;
     if (roadEntityByWay.has(road.id)) {
       const existing = roadEntityByWay.get(road.id);
-      if (!chunk.entities.includes(existing)) chunk.entities.push(existing);
-      entities.push(existing);
+      if (!tile.entities.includes(existing)) tile.entities.push(existing);
       return;
     }
 
@@ -647,195 +548,149 @@ function buildRoadMeshesForChunk(chunk, roads){
     });
 
     roadEntityByWay.set(road.id, entity);
-    chunk.wayIds.add(road.id);
-    chunk.entities.push(entity);
-    entities.push(entity);
+    tile.entities.push(entity);
   });
-
-  return entities;
 }
 
 /**
- * loadRoadChunk — pipeline de UN chunk de streaming (150 m): asegura que
- * el tile que lo contiene esté cargado (fetch local, cacheado), toma sus
- * vías crudas desde chunkRawDataCache, las eleva (si no estaban ya
- * elevadas de una carga anterior) y construye la malla. Nunca bloquea el
- * hilo principal por mucho tiempo: cede el control entre fases.
+ * loadRoadTile — pipeline completo de UN tile (2×2 km): fetch del archivo
+ * estático (si no estaba en caché), muestreo de elevación de todas sus
+ * vías, y construcción de la malla. Si el tile ya tenía sus vías elevadas
+ * en caché (roads no vacío) porque el auto ya había pasado por ahí antes,
+ * se reconstruye la malla directo, sin volver a pedir nada por red.
  */
-async function loadRoadChunk(chunkKey){
-  const chunk = roadChunks.get(chunkKey);
-  if (!chunk) return;
-  chunk.status = "loading";
+async function loadRoadTile(tileKey){
+  const tile = roadTiles.get(tileKey);
+  if (!tile) return;
+  tile.status = "loading";
+  updateHudStreamingStatus();
 
   try {
-    let roadsWithHeights = roadChunkDataCache.get(chunkKey);
-
-    if (!roadsWithHeights) {
-      const tileKey = tileKeyForChunk(chunk.cx, chunk.cy);
-      await ensureTileLoaded(tileKey);
-
-      const rawRoads = chunkRawDataCache.get(chunkKey) || [];
-      roadsWithHeights = rawRoads.length > 0 ? await sampleRoadElevations(rawRoads) : [];
-      roadChunkDataCache.set(chunkKey, roadsWithHeights);
-    }
-
-    if (roadsWithHeights.length > 0) buildRoadMeshesForChunk(chunk, roadsWithHeights);
-    chunk.status = "loaded";
-    viewer.scene.requestRender();
-  } catch (error) {
-    console.error(`Error generando el chunk vial ${chunkKey}:`, error);
-    chunk.status = "error";
-    chunk.lastError = error;
-  }
-}
-
-/**
- * processRoadLoadQueue — procesa la cola de chunks pendientes de a poco
- * (ROAD_MAX_CHUNK_LOADS_PER_TICK por pasada), cediendo el hilo principal
- * entre cada chunk para no bloquear la interfaz ni la cámara/auto mientras
- * se generan mallas nuevas.
- */
-async function processRoadLoadQueue(){
-  if (isProcessingRoadQueue) return;
-  isProcessingRoadQueue = true;
-
-  try {
-    while (roadLoadQueue.length > 0){
-      let processedThisPass = 0;
-
-      while (processedThisPass < ROAD_MAX_CHUNK_LOADS_PER_TICK && roadLoadQueue.length > 0){
-        const chunkKey = roadLoadQueue.shift();
-        roadQueueSet.delete(chunkKey);
-
-        const chunk = roadChunks.get(chunkKey);
-        if (!chunk) { continue; } // fue removido (p.ej. quedó lejos antes de procesarse)
-
-        updateHudStreamingStatus();
-        await loadRoadChunk(chunkKey);
-        processedThisPass++;
+    if (!tile.roads) {
+      let rawRoads = [];
+      const cached = roadTileCache.get(tileKey);
+      if (cached === "loaded") {
+        rawRoads = tile._rawRoads || [];
+      } else {
+        const promise = cached instanceof Promise ? cached : (async () => {
+          const response = await fetch(`${ROAD_TILES_BASE_URL}${tileKey}.json`);
+          if (response.ok) return await response.json();
+          if (response.status === 404) return []; // tile sin calles (cerro, parque, etc.)
+          console.warn(`Tile ${tileKey}: respuesta ${response.status} (se trata como vacío).`);
+          return [];
+        })();
+        roadTileCache.set(tileKey, promise);
+        rawRoads = await promise;
+        roadTileCache.set(tileKey, "loaded");
+        tile._rawRoads = rawRoads;
       }
 
-      updateHudStreamingStatus();
-      // Cede el hilo principal entre tandas para que la cámara orbital y
-      // el resto de la simulación sigan respondiendo con fluidez.
-      await yieldToMain();
-    }
-  } finally {
-    isProcessingRoadQueue = false;
-    updateHudStreamingStatus();
-  }
-}
+      const roads = rawRoads
+        .filter((r) => r.coordinates && r.coordinates.length >= 2)
+        .map((r) => ({
+          id: r.id,
+          highwayType: r.highwayType,
+          name: r.name || null,
+          coordinates: r.coordinates.map(([lon, lat]) => ({ lon, lat })),
+        }));
 
-function enqueueChunkLoad(chunkKey){
-  if (roadQueueSet.has(chunkKey)) return;
-  roadQueueSet.add(chunkKey);
-  roadLoadQueue.push(chunkKey);
+      tile.roads = roads.length > 0 ? await sampleRoadElevations(roads) : [];
+    }
+
+    if (tile.roads.length > 0) buildRoadMeshesForTile(tile, tile.roads);
+    tile.status = "loaded";
+    viewer.scene.requestRender();
+  } catch (error) {
+    console.error(`Error cargando el tile vial ${tileKey}:`, error);
+    tile.status = "error";
+    roadTileCache.delete(tileKey); // permite reintentar en el próximo paso por acá
+  }
+  updateHudStreamingStatus();
 }
 
 /**
- * unloadFarRoadChunks — descarga (quita de la escena) los chunks cuya
- * distancia al auto supera ROAD_UNLOAD_RADIUS_METERS. Los datos ya
- * descargados/elevados se mantienen en roadChunkDataCache (y los tiles
- * crudos en chunkRawDataCache/roadTileCache), así que si el auto vuelve a
- * esa zona la malla se reconstruye al instante, sin volver a pedir nada
- * por red.
+ * unloadRoadTile — saca de la escena las entidades de un tile que ya
+ * quedó fuera de la grilla 3×3 alrededor del auto. Las vías ya elevadas
+ * (tile.roads) se conservan en memoria a propósito, así reconstruir la
+ * malla al volver es instantáneo y sin red.
  */
-function unloadFarRoadChunks(carX, carY){
-  for (const [chunkKey, chunk] of roadChunks){
-    if (chunk.status !== "loaded") continue;
-
-    const chunkX = chunk.cx * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-    const chunkY = chunk.cy * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-    const dist = Math.hypot(carX - chunkX, carY - chunkY);
-
-    if (dist > ROAD_UNLOAD_RADIUS_METERS){
-      chunk.entities.forEach((e) => {
-        viewer.entities.remove(e);
-        for (const [wayId, entity] of roadEntityByWay){
-          if (entity === e) roadEntityByWay.delete(wayId);
-        }
-      });
-      chunk.entities = [];
-      roadChunks.delete(chunkKey);
-      // roadChunkDataCache / chunkRawDataCache / roadTileCache se
-      // conservan a propósito (caché local, sin costo de red al recargar).
+function unloadRoadTile(tileKey){
+  const tile = roadTiles.get(tileKey);
+  if (!tile) return;
+  tile.entities.forEach((e) => {
+    viewer.entities.remove(e);
+    for (const [wayId, entity] of roadEntityByWay){
+      if (entity === e) roadEntityByWay.delete(wayId);
     }
-  }
-  viewer.scene.requestRender();
+  });
+  tile.entities = [];
+  roadTiles.delete(tileKey);
 }
 
 function updateHudStreamingStatus(){
-  let loaded = 0;
-  for (const chunk of roadChunks.values()){
-    if (chunk.status === "loaded") loaded++;
+  let loaded = 0, loading = 0;
+  for (const tile of roadTiles.values()){
+    if (tile.status === "loaded") loaded++;
+    else if (tile.status === "loading") loading++;
   }
-  roadStreamStats = { loaded, queued: roadLoadQueue.length };
+  roadStreamStats = { loaded, loading };
   if (hudStatus){
-    hudStatus.textContent = roadLoadQueue.length > 0
-      ? `Streaming de calles: ${loaded} chunks cargados, ${roadLoadQueue.length} generando…`
-      : `Streaming de calles: ${loaded} chunks cargados (radio ${ROAD_LOAD_RADIUS_METERS} m, mundo ${(ROAD_WORLD_RADIUS_METERS/1000).toFixed(0)} km)`;
+    hudStatus.textContent = loading > 0
+      ? `Calles: ${loaded} tiles cargados, ${loading} generando…`
+      : `Calles: ${loaded} tiles cargados (grilla 3×3, mundo ${(ROAD_WORLD_RADIUS_METERS/1000).toFixed(0)} km)`;
   }
 }
 
 /**
- * updateRoadStreaming — corazón del streaming: dado la posición actual del
- * auto, calcula qué chunks deberían estar cargados (dentro de
- * ROAD_LOAD_RADIUS_METERS) y los encola si faltan, y descarga los que
- * quedaron más allá de ROAD_UNLOAD_RADIUS_METERS (histéresis). Nunca
- * genera nada fuera de ROAD_WORLD_RADIUS_METERS desde el centro de
- * Santiago, que sigue siendo el límite máximo del mundo/mapa — pero eso
- * solo importa para no pedir tiles inexistentes; el archivo de tiles ya
- * fue generado una sola vez para todo ese radio.
+ * neededTileKeysAround — la grilla de tiles que debería estar cargada
+ * alrededor de una posición del mundo: el tile que la contiene más
+ * ROAD_TILE_LOAD_MARGIN_TILES de anillo, recortada al límite del mundo
+ * (ROAD_WORLD_RADIUS_METERS desde el centro de Santiago).
  */
-function updateRoadStreaming(carLon, carLat){
-  const { x: carX, y: carY } = lonLatToLocalXY(carLon, carLat);
-
-  const distCarToCenter = Math.hypot(carX, carY);
-  if (distCarToCenter <= ROAD_WORLD_RADIUS_METERS + ROAD_LOAD_RADIUS_METERS){
-    const { cx: carCx, cy: carCy } = chunkCoordsForLonLat(carLon, carLat);
-    const chunkSpan = Math.ceil(ROAD_LOAD_RADIUS_METERS / ROAD_CHUNK_SIZE_METERS) + 1;
-
-    for (let dcx = -chunkSpan; dcx <= chunkSpan; dcx++){
-      for (let dcy = -chunkSpan; dcy <= chunkSpan; dcy++){
-        const cx = carCx + dcx;
-        const cy = carCy + dcy;
-        const chunkX = cx * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-        const chunkY = cy * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-        const dist = Math.hypot(carX - chunkX, carY - chunkY);
-        if (dist > ROAD_LOAD_RADIUS_METERS) continue;
-
-        const centerDist = Math.hypot(chunkX, chunkY);
-        if (centerDist > ROAD_WORLD_RADIUS_METERS) continue;
-
-        const key = chunkKeyFor(cx, cy);
-        if (roadChunks.has(key)) continue;
-        if (roadQueueSet.has(key)) continue;
-
-        const center = chunkCenterLonLat(cx, cy);
-        roadChunks.set(key, {
-          cx, cy, centerLon: center.lon, centerLat: center.lat,
-          status: "queued", entities: [], wayIds: new Set(),
-        });
-        enqueueChunkLoad(key);
-      }
+function neededTileKeysAround(lon, lat){
+  const { tx: carTx, ty: carTy } = tileCoordsForLonLat(lon, lat);
+  const keys = [];
+  for (let dtx = -ROAD_TILE_LOAD_MARGIN_TILES; dtx <= ROAD_TILE_LOAD_MARGIN_TILES; dtx++){
+    for (let dty = -ROAD_TILE_LOAD_MARGIN_TILES; dty <= ROAD_TILE_LOAD_MARGIN_TILES; dty++){
+      const tx = carTx + dtx;
+      const ty = carTy + dty;
+      const center = tileCenterLonLat(tx, ty);
+      const { x, y } = lonLatToLocalXY(center.lon, center.lat);
+      if (Math.hypot(x, y) > ROAD_WORLD_RADIUS_METERS + ROAD_TILE_SIZE_METERS) continue;
+      keys.push(tileKeyFor(tx, ty));
     }
   }
+  return { carTx, carTy, keys };
+}
 
-  unloadFarRoadChunks(carX, carY);
+/**
+ * updateRoadStreaming — recalcula la grilla 3×3 de tiles alrededor de la
+ * posición actual del auto: carga los que faltan y descarga los que ya
+ * quedaron fuera. Nunca pide nada más allá de ROAD_WORLD_RADIUS_METERS.
+ */
+function updateRoadStreaming(carLon, carLat){
+  const { keys: neededKeys } = neededTileKeysAround(carLon, carLat);
+  const neededSet = new Set(neededKeys);
 
-  if (roadLoadQueue.length > 0 && !isProcessingRoadQueue){
-    processRoadLoadQueue();
+  for (const key of neededKeys){
+    if (roadTiles.has(key)) continue;
+    const [tx, ty] = key.split("_").map(Number);
+    roadTiles.set(key, { tx, ty, status: "queued", entities: [], roads: null });
+    loadRoadTile(key); // en paralelo — cada tile es un solo fetch + una sola tanda de elevación
+  }
+
+  for (const key of Array.from(roadTiles.keys())){
+    if (!neededSet.has(key)) unloadRoadTile(key);
   }
 
   updateHudStreamingStatus();
 }
 
 /**
- * startRoadStreaming — arranca el watcher periódico que sigue la posición
- * del auto y dispara updateRoadStreaming cuando se movió lo suficiente
- * (ROAD_STREAM_MOVE_THRESHOLD) desde el último chequeo. Corre con
- * setInterval en vez de en cada frame para no gastar CPU de más — la
- * cámara/auto siguen funcionando con total normalidad mientras tanto.
+ * startRoadStreaming — arranca el watcher periódico que sigue el TILE
+ * actual del auto (no su posición exacta) y solo dispara
+ * updateRoadStreaming cuando el auto cruzó a un tile distinto — mucho más
+ * barato que reevaluar por distancia recorrida.
  */
 function startRoadStreaming(){
   if (roadStreamingActive) return;
@@ -852,15 +707,11 @@ function startRoadStreaming(){
     if (!carto) return;
     const carLon = Cesium.Math.toDegrees(carto.longitude);
     const carLat = Cesium.Math.toDegrees(carto.latitude);
-    const { x, y } = lonLatToLocalXY(carLon, carLat);
+    const { tx, ty } = tileCoordsForLonLat(carLon, carLat);
 
-    if (lastStreamCarX !== null){
-      const moved = Math.hypot(x - lastStreamCarX, y - lastStreamCarY);
-      if (moved < ROAD_STREAM_MOVE_THRESHOLD) return;
-    }
-
-    lastStreamCarX = x;
-    lastStreamCarY = y;
+    if (tx === lastStreamCarTx && ty === lastStreamCarTy) return;
+    lastStreamCarTx = tx;
+    lastStreamCarTy = ty;
     updateRoadStreaming(carLon, carLat);
   }, ROAD_STREAM_CHECK_INTERVAL_MS);
 }
@@ -874,61 +725,35 @@ function stopRoadStreaming(){
 }
 
 /**
- * generateInitialRoadPatch — genera SOLO las calles dentro de
- * ROAD_LOAD_RADIUS_METERS del punto de spawn (no los 45 km completos), y
- * luego deja andando el streaming continuo para el resto del recorrido.
- *
- * Ya no hay ninguna consulta a Overpass acá: se determinan los tiles
- * estáticos que cubren el radio inicial (típicamente 1 a 4 archivos de
- * ~4 km² cada uno), se piden en paralelo (fetch local, rápido), se agrupan sus
- * vías en chunks, y se hace UN solo muestreo de elevación combinado para
- * que la barra de progreso "Muestreando elevación…" avance de forma
- * continua y realmente termine.
+ * generateInitialRoadPatch — carga la grilla 3×3 de tiles alrededor del
+ * punto de spawn ANTES de ocultar la pantalla de carga (para que el auto
+ * aparezca con calles ya dibujadas debajo), y luego deja andando el
+ * watcher de tiles para el resto del recorrido.
  */
 async function generateInitialRoadPatch(spawnLon, spawnLat){
   try {
-    setLoadingStep("stepOsm", "active", "Cargando archivo local de calles (sin llamadas a Overpass)…");
+    setLoadingStep("stepOsm", "active", "Cargando archivos locales de calles (sin llamadas a Overpass)…");
 
-    const { x: spawnX, y: spawnY } = lonLatToLocalXY(spawnLon, spawnLat);
-    const margin = ROAD_CHUNK_SIZE_METERS;
-    const minTile = tileCoordsForXY(spawnX - ROAD_LOAD_RADIUS_METERS - margin, spawnY - ROAD_LOAD_RADIUS_METERS - margin);
-    const maxTile = tileCoordsForXY(spawnX + ROAD_LOAD_RADIUS_METERS + margin, spawnY + ROAD_LOAD_RADIUS_METERS + margin);
+    const { carTx, carTy, keys: initialKeys } = neededTileKeysAround(spawnLon, spawnLat);
+    lastStreamCarTx = carTx;
+    lastStreamCarTy = carTy;
 
-    const tileFetches = [];
-    for (let tx = minTile.tx; tx <= maxTile.tx; tx++){
-      for (let ty = minTile.ty; ty <= maxTile.ty; ty++){
-        tileFetches.push(ensureTileLoaded(tileKeyFor(tx, ty)));
-      }
-    }
-    await Promise.all(tileFetches);
-
-    // Junta todos los chunks que caen dentro del radio inicial y saca sus
-    // vías crudas (ya en memoria gracias a los tiles recién cargados).
-    const { cx: spawnCx, cy: spawnCy } = chunkCoordsForLonLat(spawnLon, spawnLat);
-    const chunkSpan = Math.ceil((ROAD_LOAD_RADIUS_METERS + margin) / ROAD_CHUNK_SIZE_METERS);
-    const initialChunkKeys = [];
-
-    for (let dcx = -chunkSpan; dcx <= chunkSpan; dcx++){
-      for (let dcy = -chunkSpan; dcy <= chunkSpan; dcy++){
-        const cx = spawnCx + dcx;
-        const cy = spawnCy + dcy;
-        const chunkX = cx * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-        const chunkY = cy * ROAD_CHUNK_SIZE_METERS + ROAD_CHUNK_SIZE_METERS / 2;
-        if (Math.hypot(spawnX - chunkX, spawnY - chunkY) > ROAD_LOAD_RADIUS_METERS) continue;
-        initialChunkKeys.push(chunkKeyFor(cx, cy));
-      }
+    for (const key of initialKeys){
+      const [tx, ty] = key.split("_").map(Number);
+      roadTiles.set(key, { tx, ty, status: "queued", entities: [], roads: null });
     }
 
-    const allRoads = [];
-    const roadsPerChunkKey = new Map();
-    for (const chunkKey of initialChunkKeys){
-      const raw = chunkRawDataCache.get(chunkKey) || [];
-      roadsPerChunkKey.set(chunkKey, raw);
-      allRoads.push(...raw);
-    }
+    // Los ROAD_SAMPLE_BATCH puntos por tanda ya ceden el hilo principal
+    // (yieldToMain), así que cargar los tiles iniciales en paralelo no
+    // bloquea la interfaz — y hace que el parche inicial aparezca más rápido.
+    let totalWays = 0;
+    await Promise.all(initialKeys.map(async (key) => {
+      await loadRoadTile(key);
+      const tile = roadTiles.get(key);
+      if (tile) totalWays += tile.roads?.length ?? 0;
+    }));
 
-    markStepDone("stepOsm", `${allRoads.length} vías cargadas desde archivo local en el radio inicial de ${ROAD_LOAD_RADIUS_METERS} m.`);
-    if (allRoads.length === 0) {
+    if (totalWays === 0) {
       console.warn(
         "[SantiagoGames] No se encontraron vías en data/tiles/ para esta zona. " +
         "¿Corriste `node scripts/fetch-roads.mjs` y pusheaste la carpeta data/tiles/? " +
@@ -936,42 +761,16 @@ async function generateInitialRoadPatch(spawnLon, spawnLat){
       );
     }
 
-    if (allRoads.length > 0){
-      setLoadingStep("stepElevation", "active", "Muestreando elevación real…");
-      await sampleRoadElevations(allRoads); // una sola pasada, progreso continuo y coherente
-      markStepDone("stepElevation", "Elevación real aplicada a cada tramo.");
+    markStepDone("stepOsm", `${totalWays} vías cargadas desde archivos locales (grilla 3×3 sobre el spawn).`);
+    markStepDone("stepElevation", "Elevación real aplicada a cada tramo.");
+    markStepDone("stepMesh", `Malla procedural generada para ${totalWays} tramos.`);
 
-      setLoadingStep("stepMesh", "active", "Generando malla procedural…");
-      let builtChunks = 0;
-      for (const [cxcy, cx, cy] of initialChunkKeys.map((k) => [k, ...k.split("_").map(Number)])){
-        const roads = roadsPerChunkKey.get(cxcy);
-        if (!roads || roads.length === 0) continue;
-
-        const center = chunkCenterLonLat(cx, cy);
-        const chunk = {
-          cx, cy, centerLon: center.lon, centerLat: center.lat,
-          status: "loaded", entities: [], wayIds: new Set(),
-        };
-        roadChunks.set(cxcy, chunk);
-        roadChunkDataCache.set(cxcy, roads);
-        buildRoadMeshesForChunk(chunk, roads);
-        builtChunks++;
-        if (builtChunks % 4 === 0) await yieldToMain();
-      }
-      markStepDone("stepMesh", `${allRoads.length} tramos generados en ${builtChunks} chunks.`);
-    } else {
-      setLoadingStep("stepElevation", "done", "Sin vías en el radio inicial — se omite elevación.");
-      setLoadingStep("stepMesh", "done", "Sin malla que generar en el radio inicial.");
-    }
-
-    lastStreamCarX = null; // fuerza una primera evaluación real del watcher
-    lastStreamCarY = null;
     startRoadStreaming();
   } catch (error) {
     // Un fallo puntual (p.ej. data/tiles/ no desplegado, o un problema de
     // red local) NO debe bloquear la simulación: se informa como error
-    // real (no como "atascado") y el streaming se deja igual en marcha,
-    // reintentará solo cuando el auto se mueva.
+    // real (no como "atascado") y el watcher se deja igual en marcha,
+    // reintentará solo cuando el auto se mueva a un tile nuevo.
     console.error("Error generando el parche vial inicial:", error);
     setLoadingStep("stepOsm", "error", "No se pudo cargar el archivo local de calles (¿falta desplegar data/tiles/? ver consola).");
     startRoadStreaming();
@@ -979,10 +778,200 @@ async function generateInitialRoadPatch(spawnLon, spawnLat){
 }
 
 /**
+/* ===================== SISTEMA DE CONDUCCIÓN (portado de GeoDrive) =====
+   Física simplificada de vehículo terrestre — misma fórmula que usa
+   GeoDrive para 'car' (updateCesiumCamera / rama ground-vehicle):
+   acelerar/frenar con fricción cuando no hay input, radio de giro
+   proporcional a la velocidad, y cámara en tercera persona persiguiendo
+   al auto con lag independiente en heading (se abre en las curvas y
+   alcanza de nuevo) y sin lag en la distancia (nunca se "cae" atrás a
+   alta velocidad). Reemplaza el trackedEntity/orbit estático anterior:
+   ahora el auto realmente se conduce con teclado/D-pad/pedales. */
+const CAR = {
+  accel: 15,          // km/h por segundo, pedal de gas
+  brake: 25,          // km/h por segundo, pedal de freno
+  friction: 4,         // km/h por segundo, desaceleración libre (sin input)
+  maxSpeed: 130,        // km/h
+  minSpeed: -30,         // km/h (reversa)
+  baseTurnRate: 120,      // °/s a máxima deflexión de dirección
+  steeringSensitivity: 1.0,
+};
+
+// Estado en vivo del auto (posición en grados, heading en grados, km/h).
+const carState = { lat: SPAWN_LAT, lng: SPAWN_LON, heading: SPAWN_HEADING_DEG, speed: 0 };
+
+// Input activo: gas/freno/izquierda/derecha, seteado por teclado y por los
+// botones táctiles (D-pad + pedales) — ambos escriben al mismo objeto, así
+// que funcionan indistintamente o combinados.
+const driveInput = { forward: false, back: false, left: false, right: false };
+
+let carAnimFrameId = null;
+let carLastFrameTime = null;
+let camSmoothHeadingRad = null; // heading suavizado de la cámara (lag en curvas)
+const CAMERA_BACK_METERS = 9;   // distancia detrás del auto (no tiene lag: nunca se queda atrás)
+const CAMERA_UP_METERS = 3.8;
+const CAMERA_FOLLOW_DELAY = 1.0; // 1.0 = feel original de GeoDrive; >1 más lag, <1 más ágil
+
+function bindDriveKey(key, prop){
+  window.addEventListener("keydown", (e) => { if (e.key === key) driveInput[prop] = true; });
+  window.addEventListener("keyup",   (e) => { if (e.key === key) driveInput[prop] = false; });
+}
+["ArrowUp", "w", "W"].forEach((k) => bindDriveKey(k, "forward"));
+["ArrowDown", "s", "S"].forEach((k) => bindDriveKey(k, "back"));
+["ArrowLeft", "a", "A"].forEach((k) => bindDriveKey(k, "left"));
+["ArrowRight", "d", "D"].forEach((k) => bindDriveKey(k, "right"));
+
+function bindDriveButton(el, prop){
+  if (!el) return;
+  const press = (e) => { e.preventDefault(); driveInput[prop] = true; el.classList.add("is-pressed"); };
+  const release = (e) => { if (e) e.preventDefault(); driveInput[prop] = false; el.classList.remove("is-pressed"); };
+  el.addEventListener("pointerdown", press);
+  el.addEventListener("pointerup", release);
+  el.addEventListener("pointerleave", release);
+  el.addEventListener("pointercancel", release);
+}
+bindDriveButton(document.getElementById("btnGas"), "forward");
+bindDriveButton(document.getElementById("btnBrake"), "back");
+bindDriveButton(document.getElementById("btnLeft"), "left");
+bindDriveButton(document.getElementById("btnRight"), "right");
+
+const speedValueEl = document.getElementById("speedValue");
+
+/**
+ * updateCarPhysics — igual fórmula que GeoDrive para vehículos terrestres:
+ * acelera/frena hacia maxSpeed/minSpeed con fricción libre cuando no hay
+ * input, gira proporcional a la velocidad actual (parado no gira en el
+ * lugar), y avanza en lat/lng según heading. dt en segundos.
+ */
+function updateCarPhysics(dt){
+  if (driveInput.forward) carState.speed += CAR.accel * dt;
+  else if (driveInput.back) carState.speed -= CAR.brake * dt;
+  else {
+    if (Math.abs(carState.speed) < CAR.friction * dt) carState.speed = 0;
+    else carState.speed -= Math.sign(carState.speed) * CAR.friction * dt;
+  }
+  carState.speed = Math.max(CAR.minSpeed, Math.min(carState.speed, CAR.maxSpeed));
+
+  const turnInput = driveInput.left ? -1 : driveInput.right ? 1 : 0;
+  if (Math.abs(carState.speed) > 0.5){
+    carState.heading += CAR.baseTurnRate * turnInput * CAR.steeringSensitivity * dt * Math.sign(carState.speed);
+  }
+  carState.heading = (carState.heading + 360) % 360;
+
+  const hdgRad = Cesium.Math.toRadians(carState.heading);
+  carState.lat += (carState.speed / 3.6 * Math.cos(hdgRad)) / 111320 * dt;
+  carState.lng += (carState.speed / 3.6 * Math.sin(hdgRad)) / (111320 * Math.cos(Cesium.Math.toRadians(carState.lat))) * dt;
+}
+
+/**
+ * updateCarEntityAndCamera — aplica carState al modelo 3D y mueve la
+ * cámara en tercera persona persiguiendo al auto (mismo split-axis spring
+ * que GeoDrive: la distancia detrás nunca tiene lag —se reconstruye desde
+ * la posición real cada frame—, solo el heading se suaviza, así la cámara
+ * se abre en las curvas y alcanza de nuevo en vez de rotar en seco).
+ */
+function updateCarEntityAndCamera(dt){
+  if (!audiEntity || !viewer) return;
+
+  const groundHeight = _lastCarGroundHeight ?? 0;
+  const carPosition = Cesium.Cartesian3.fromDegrees(carState.lng, carState.lat, groundHeight);
+  const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(carState.heading), 0, 0);
+  audiEntity.position = carPosition;
+  audiEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(carPosition, hpr);
+
+  // Heading suavizado de la cámara (lag transversal — abre en curvas).
+  const targetHeadingRad = Cesium.Math.toRadians(carState.heading);
+  if (camSmoothHeadingRad === null){
+    camSmoothHeadingRad = targetHeadingRad;
+  } else {
+    let diff = targetHeadingRad - camSmoothHeadingRad;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    const headingAlpha = 1.0 - Math.exp(-(6 / CAMERA_FOLLOW_DELAY) * dt);
+    camSmoothHeadingRad += diff * headingAlpha;
+  }
+
+  const vehicleTransform = Cesium.Transforms.headingPitchRollToFixedFrame(
+    carPosition, new Cesium.HeadingPitchRoll(camSmoothHeadingRad, 0, 0)
+  );
+  const camOffset = new Cesium.Cartesian3(0, -CAMERA_BACK_METERS, CAMERA_UP_METERS);
+  const camPos = Cesium.Matrix4.multiplyByPoint(vehicleTransform, camOffset, new Cesium.Cartesian3());
+
+  // Apunta directo hacia el auto desde la posición de cámara calculada
+  // (en vez de usar viewer.camera.lookAt, que deja la cámara "pegada" en
+  // modo órbita) — así el drag/scroll del mouse para free-look sigue
+  // disponible entre frames sin pelear con el chase cam.
+  const toCar = Cesium.Cartesian3.subtract(carPosition, camPos, new Cesium.Cartesian3());
+  const dist = Cesium.Cartesian3.magnitude(toCar);
+  if (dist > 0.01){
+    const dir = Cesium.Cartesian3.normalize(toCar, new Cesium.Cartesian3());
+    const up = new Cesium.Cartesian3(0, 0, 1);
+    viewer.camera.setView({ destination: camPos, orientation: { direction: dir, up } });
+  }
+}
+
+let _lastCarGroundHeight = null;
+let _carGroundSampleInFlight = false;
+
+/**
+ * sampleCarGroundHeight — re-muestrea la altura real del terreno bajo el
+ * auto de forma periódica (no cada frame, es una llamada relativamente
+ * cara) para que el auto se mantenga apoyado en el suelo/rampas mientras
+ * se conduce, igual que hace GeoDrive con su plano de referencia.
+ */
+async function sampleCarGroundHeight(){
+  if (_carGroundSampleInFlight || !viewer) return;
+  _carGroundSampleInFlight = true;
+  try {
+    const carto = Cesium.Cartographic.fromDegrees(carState.lng, carState.lat);
+    const sampled = await viewer.scene.sampleHeightMostDetailed([carto]);
+    if (sampled && sampled[0] && isFinite(sampled[0].height)){
+      _lastCarGroundHeight = sampled[0].height;
+    }
+  } catch (e) { /* sin conexión momentánea, se reintenta en el próximo ciclo */ }
+  _carGroundSampleInFlight = false;
+}
+
+function carAnimationLoop(timestampMs){
+  if (carLastFrameTime === null) carLastFrameTime = timestampMs;
+  const dt = Math.min(0.1, (timestampMs - carLastFrameTime) / 1000); // clamp: evita saltos si la pestaña estuvo en background
+  carLastFrameTime = timestampMs;
+
+  updateCarPhysics(dt);
+  updateCarEntityAndCamera(dt);
+  updateNavMap();
+  if (speedValueEl) speedValueEl.textContent = Math.round(Math.abs(carState.speed));
+
+  carAnimFrameId = requestAnimationFrame(carAnimationLoop);
+}
+
+function startCarLoop(){
+  if (carAnimFrameId !== null) return;
+  carLastFrameTime = null;
+  carAnimFrameId = requestAnimationFrame(carAnimationLoop);
+  if (_carGroundSampleTimerId === null){
+    _carGroundSampleTimerId = setInterval(sampleCarGroundHeight, 400);
+  }
+}
+let _carGroundSampleTimerId = null;
+
+function stopCarLoop(){
+  if (carAnimFrameId !== null){
+    cancelAnimationFrame(carAnimFrameId);
+    carAnimFrameId = null;
+  }
+  if (_carGroundSampleTimerId !== null){
+    clearInterval(_carGroundSampleTimerId);
+    _carGroundSampleTimerId = null;
+  }
+}
+
+/**
  * spawnAudiQuattro — coloca el Audi Quattro en el punto de spawn fijo
  * (SPAWN_LON, SPAWN_LAT) orientado a SPAWN_HEADING_DEG (330–335°, NNO),
- * y deja la cámara por defecto detrás del auto (vista de conducción),
- * sin importar qué juego se haya seleccionado en el selector.
+ * arranca la física de conducción y deja la cámara en tercera persona
+ * detrás del auto, sin importar qué juego se haya seleccionado en el
+ * selector.
  */
 async function spawnAudiQuattro(){
   setLoadingStep("stepSpawn", "active", "Posicionando el Audi Quattro…");
@@ -1000,6 +989,13 @@ async function spawnAudiQuattro(){
   } catch (e) {
     console.warn("No se pudo muestrear la altura del terreno en el spawn, usando 0.", e);
   }
+  _lastCarGroundHeight = groundHeight;
+
+  carState.lat = SPAWN_LAT;
+  carState.lng = SPAWN_LON;
+  carState.heading = SPAWN_HEADING_DEG;
+  carState.speed = 0;
+  camSmoothHeadingRad = null;
 
   const carPosition = Cesium.Cartesian3.fromDegrees(SPAWN_LON, SPAWN_LAT, groundHeight);
   const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(SPAWN_HEADING_DEG), 0, 0);
@@ -1008,6 +1004,10 @@ async function spawnAudiQuattro(){
   if (audiEntity) {
     viewer.entities.remove(audiEntity);
   }
+  // La cámara maneja manualmente (chase cam propia) — no usamos
+  // viewer.trackedEntity, así el input de conducción no compite con el
+  // control orbital nativo de Cesium.
+  viewer.trackedEntity = undefined;
 
   audiEntity = viewer.entities.add({
     name: "1988 Audi Quattro",
@@ -1021,18 +1021,9 @@ async function spawnAudiQuattro(){
     },
   });
 
-  // Cámara en tercera persona, orbitable alrededor del auto: al usar
-  // trackedEntity, Cesium ancla el pivote de la cámara al auto en vez
-  // de al globo — arrastrar con el mouse orbita alrededor del Audi
-  // (no mueve/paneas la escena completa), y el scroll acerca/aleja.
-  viewer.trackedEntity = audiEntity;
-  await viewer.flyTo(audiEntity, {
-    offset: new Cesium.HeadingPitchRange(
-      Cesium.Math.toRadians(SPAWN_HEADING_DEG), // detrás del auto, mismo heading
-      Cesium.Math.toRadians(-18),                // ligeramente por arriba, mirando hacia abajo
-      16                                          // metros de distancia (rango orbital inicial)
-    ),
-  });
+  updateCarEntityAndCamera(0);
+  if (!navMap) initNavMap();
+  startCarLoop();
 
   markStepDone("stepSpawn", "Audi Quattro listo en el spawn.");
 }
@@ -1054,6 +1045,7 @@ function goToSelector(){
   // Se reactiva solo con el watcher; no se pierde el progreso: los chunks
   // cargados y la caché de tiles locales siguen intactos en memoria.
   stopRoadStreaming();
+  stopCarLoop();
 }
 
 selectBtn.addEventListener("click", () => {
@@ -1064,6 +1056,7 @@ selectBtn.addEventListener("click", () => {
 backBtn.addEventListener("click", goToSelector);
 
 /* ===================== SISTEMA DE OPTIMIZACIÓN (GeoDrive) ===================== */
+
 
 /**
  * applyGdOptimizations — vuelca gdSettings + GD_AUTO_OPTIMIZATIONS sobre el
@@ -1100,8 +1093,8 @@ function applyGdOptimizations(){
   // Optimizaciones automáticas de GeoDrive — LOD dinámico, reducción de
   // carga de GPU/CPU para tiles lejanos, y techo de memoria para no
   // acumular geometría fuera del área relevante.
-  tileset.dynamicScreenSpaceError = GD_AUTO_OPTIMIZATIONS.dynamicScreenSpaceError;
-  tileset.dynamicScreenSpaceErrorDensity = GD_AUTO_OPTIMIZATIONS.dynamicScreenSpaceErrorDensity;
+  tileset.dynamicScreenSpaceError = gdSettings.dynamicScreenSpaceError;
+  tileset.dynamicScreenSpaceErrorDensity = gdSettings.dynamicScreenSpaceErrorDensity;
   tileset.baseScreenSpaceError = GD_AUTO_OPTIMIZATIONS.baseScreenSpaceError;
   tileset.skipScreenSpaceErrorFactor = GD_AUTO_OPTIMIZATIONS.skipScreenSpaceErrorFactor;
   tileset.skipLevels = GD_AUTO_OPTIMIZATIONS.skipLevels;
@@ -1164,6 +1157,10 @@ const occlusionToggle = document.getElementById("occlusionToggle");
 const depthTerrainToggle = document.getElementById("depthTerrainToggle");
 const renderDistanceSlider = document.getElementById("renderDistanceSlider");
 const renderDistanceValue = document.getElementById("renderDistanceValue");
+const dynamicSseToggle = document.getElementById("dynamicSseToggle");
+const dynamicSseDensitySlider = document.getElementById("dynamicSseDensitySlider");
+const dynamicSseDensityValue = document.getElementById("dynamicSseDensityValue");
+const dynamicSseDensityRow = document.getElementById("dynamicSseDensityRow");
 
 function openSettings(){
   settingsOverlay.hidden = false;
@@ -1204,11 +1201,242 @@ renderDistanceSlider.addEventListener("input", () => {
   _gdDistanceIsFar = null; // fuerza reevaluación inmediata en el próximo frame
 });
 
+/**
+ * Dynamic Screen Space Error — mismo mecanismo de GeoDrive: cuando está
+ * activo, Cesium reduce automáticamente el detalle exigido a los 3D Tiles
+ * a medida que se alejan de cámara (sin tocar la calidad cerca del auto),
+ * aliviando GPU/CPU. La densidad controla qué tan agresiva es esa caída.
+ */
+dynamicSseToggle.addEventListener("change", () => {
+  gdSettings.dynamicScreenSpaceError = dynamicSseToggle.checked;
+  dynamicSseDensityRow.classList.toggle("is-disabled", !dynamicSseToggle.checked);
+  dynamicSseDensitySlider.disabled = !dynamicSseToggle.checked;
+  applyGdOptimizations();
+});
+
+dynamicSseDensitySlider.addEventListener("input", () => {
+  gdSettings.dynamicScreenSpaceErrorDensity = Number(dynamicSseDensitySlider.value);
+  dynamicSseDensityValue.textContent = dynamicSseDensitySlider.value;
+  applyGdOptimizations();
+});
+
 /* ============================== ARRANQUE ============================== */
 // Marcador de versión: si en la consola del navegador NO ves este mensaje,
 // el navegador/GitHub Pages está sirviendo un script.js viejo en caché —
 // hacé un hard refresh (o recarga forzada) antes de reportar cualquier
 // bug de carga/streaming.
+/* ===================== NAVEGACIÓN: BUSCADOR + MINIMAPA (GeoDrive) =====
+   Portado de #gps-search / #gps-minimap-* de GeoDrive: geocodificación
+   con Nominatim (OpenStreetMap), minimapa Leaflet en modo "head-up"
+   (rota con el heading del auto, la flecha del auto queda fija mirando
+   arriba), con distancia en línea recta al destino, arrastre del panel,
+   redimensionado libre y minimizado — mismos mecanismos, estilo dorado/
+   negro en vez del azul/verde original. */
+let navMap = null;
+let navMapDestMarker = null;
+let navMapCurrentZoom = 15;
+let navDestLatLng = null; // {lat, lng, label} o null si no hay destino
+let _navMapLastTick = 0;
+
+function initNavMap(){
+  const container = document.getElementById("navMinimap");
+  if (!container || typeof L === "undefined") return;
+
+  navMap = L.map("navMinimap", {
+    zoomControl: false,
+    dragging: false,
+    scrollWheelZoom: false,
+    touchZoom: false,
+    doubleClickZoom: false,
+    keyboard: false,
+    zoomSnap: 0,
+    zoomAnimation: false,
+    trackResize: false,
+    attributionControl: false,
+  }).setView([carState.lat, carState.lng], navMapCurrentZoom);
+
+  L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 22 }
+  ).addTo(navMap);
+
+  requestAnimationFrame(() => { if (navMap) navMap.invalidateSize(false); });
+}
+
+/** Llamado desde el loop del auto — internamente throttleado a ~10 fps. */
+function updateNavMap(){
+  if (!navMap) return;
+  const now = performance.now();
+  if (now - _navMapLastTick < 100) return;
+  _navMapLastTick = now;
+
+  navMap.setView([carState.lat, carState.lng], navMapCurrentZoom, { animate: false });
+
+  // Rotación head-up: el mapa gira con el heading, la flecha del auto
+  // queda fija apuntando siempre hacia arriba del overlay.
+  const el = document.getElementById("navMinimap");
+  if (el) el.style.transform = `rotate(${-carState.heading}deg)`;
+
+  const distEl = document.getElementById("navMinimapDistWrap");
+  if (navDestLatLng){
+    if (!navMapDestMarker){
+      navMapDestMarker = L.marker([navDestLatLng.lat, navDestLatLng.lng], {
+        icon: L.divIcon({
+          className: "",
+          html: `<div style="width:13px;height:13px;background:#E8B93A;border:2.5px solid #121210;border-radius:50%;box-shadow:0 0 8px rgba(232,185,58,0.85);"></div>`,
+          iconSize: [13, 13], iconAnchor: [6, 6],
+        }),
+        zIndexOffset: 500,
+      }).addTo(navMap);
+    } else {
+      navMapDestMarker.setLatLng([navDestLatLng.lat, navDestLatLng.lng]);
+    }
+    const d = greatCircleDistanceKm(carState.lat, carState.lng, navDestLatLng.lat, navDestLatLng.lng);
+    if (distEl) distEl.textContent = d < 1 ? `${Math.round(d * 1000)} m` : `${d.toFixed(1)} km`;
+  } else if (navMapDestMarker){
+    navMap.removeLayer(navMapDestMarker);
+    navMapDestMarker = null;
+    if (distEl) distEl.textContent = "—";
+  }
+}
+
+function greatCircleDistanceKm(lat1, lon1, lat2, lon2){
+  const R = 6371;
+  const dLat = Cesium.Math.toRadians(lat2 - lat1);
+  const dLon = Cesium.Math.toRadians(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(Cesium.Math.toRadians(lat1)) * Math.cos(Cesium.Math.toRadians(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function setNavDestination(lat, lng, label){
+  navDestLatLng = { lat, lng, label: label || null };
+  const destLabelEl = document.getElementById("navMinimapDestLabel");
+  if (destLabelEl) destLabelEl.textContent = "📍 " + (label || `${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+}
+
+async function searchNavLocation(){
+  const input = document.getElementById("navSearchInput");
+  const q = input && input.value.trim();
+  if (!q) return;
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+    if (data && data.length > 0){
+      setNavDestination(parseFloat(data[0].lat), parseFloat(data[0].lon), data[0].display_name || q);
+    } else {
+      const destLabelEl = document.getElementById("navMinimapDestLabel");
+      if (destLabelEl) destLabelEl.textContent = "Sin resultados para \"" + q + "\"";
+    }
+  } catch (e) {
+    console.warn("Búsqueda de dirección falló (sin conexión a Nominatim):", e);
+  }
+}
+
+const navSearchBtn = document.getElementById("navSearchBtn");
+const navSearchInput = document.getElementById("navSearchInput");
+if (navSearchBtn) navSearchBtn.addEventListener("click", searchNavLocation);
+if (navSearchInput) navSearchInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") searchNavLocation();
+});
+
+const navZoomInBtn = document.getElementById("navZoomIn");
+const navZoomOutBtn = document.getElementById("navZoomOut");
+function navMapZoom(delta){
+  navMapCurrentZoom = Math.min(19, Math.max(10, navMapCurrentZoom + delta));
+  if (navMap) navMap.setView([carState.lat, carState.lng], navMapCurrentZoom, { animate: false });
+}
+if (navZoomInBtn) navZoomInBtn.addEventListener("click", () => navMapZoom(1));
+if (navZoomOutBtn) navZoomOutBtn.addEventListener("click", () => navMapZoom(-1));
+
+/* ---- Minimizar (colapsa a solo el header, igual que GeoDrive) ---- */
+(function setupNavMinimapMinimize(){
+  const overlay = document.getElementById("navMinimapOverlay");
+  const minBtn = document.getElementById("navMinimapBtnMin");
+  if (!overlay || !minBtn) return;
+  let minimized = false;
+  minBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    minimized = !minimized;
+    overlay.classList.toggle("is-minimized", minimized);
+    minBtn.textContent = minimized ? "▢" : "–";
+    if (!minimized && navMap) requestAnimationFrame(() => navMap.invalidateSize(false));
+  });
+})();
+
+/* ---- Arrastre del panel (agarrando el header) ---- */
+(function setupNavMinimapDrag(){
+  const overlay = document.getElementById("navMinimapOverlay");
+  const header = document.getElementById("navMinimapHeader");
+  if (!overlay || !header) return;
+  let dragging = false, offsetX = 0, offsetY = 0;
+
+  header.addEventListener("pointerdown", (e) => {
+    if (e.target.tagName === "BUTTON") return;
+    dragging = true;
+    const r = overlay.getBoundingClientRect();
+    offsetX = e.clientX - r.left;
+    offsetY = e.clientY - r.top;
+    try { header.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
+  });
+  header.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    let x = Math.max(0, Math.min(window.innerWidth - 60, e.clientX - offsetX));
+    let y = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - offsetY));
+    overlay.style.left = x + "px";
+    overlay.style.top = y + "px";
+    overlay.style.right = "auto";
+  });
+  ["pointerup", "pointercancel"].forEach((ev) =>
+    header.addEventListener(ev, () => { dragging = false; }));
+})();
+
+/* ---- Redimensionado libre (arrastrando la esquina) ---- */
+(function setupNavMinimapResize(){
+  const handle = document.getElementById("navMinimapResizeHandle");
+  const overlay = document.getElementById("navMinimapOverlay");
+  const viewport = document.getElementById("navMinimapViewport");
+  const mapEl = document.getElementById("navMinimap");
+  if (!handle || !overlay || !viewport || !mapEl) return;
+
+  const BASE_W = 240, BASE_H = 190;
+  const BASE_MAP_W = 360, BASE_MAP_H = 360;
+  const MIN_W = 150, MAX_W = 560;
+  let resizing = false, startX = 0, startY = 0, startW = BASE_W;
+
+  function applySize(w){
+    w = Math.max(MIN_W, Math.min(MAX_W, w));
+    const h = w * (BASE_H / BASE_W);
+    overlay.style.width = w + "px";
+    viewport.style.width = w + "px";
+    viewport.style.height = h + "px";
+    const mapW = w * (BASE_MAP_W / BASE_W);
+    const mapH = h * (BASE_MAP_H / BASE_H);
+    mapEl.style.width = mapW + "px";
+    mapEl.style.height = mapH + "px";
+    mapEl.style.left = ((w - mapW) / 2) + "px";
+    mapEl.style.top = ((h - mapH) / 2) + "px";
+    if (navMap) navMap.invalidateSize(false);
+  }
+
+  handle.addEventListener("pointerdown", (e) => {
+    resizing = true;
+    startX = e.clientX; startY = e.clientY;
+    startW = overlay.getBoundingClientRect().width;
+    handle.setPointerCapture(e.pointerId);
+    e.stopPropagation();
+    e.preventDefault();
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!resizing) return;
+    const delta = (e.clientX - startX) + (e.clientY - startY);
+    applySize(startW + delta / 2);
+  });
+  ["pointerup", "pointercancel"].forEach((ev) =>
+    handle.addEventListener(ev, () => { resizing = false; }));
+})();
+
 console.log("[SantiagoGames] script.js — streaming de calles v2 (consulta única + progreso continuo)");
 
 // Al cargar la página SIEMPRE se ve primero el selector.

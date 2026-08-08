@@ -422,6 +422,11 @@ body{
   gap:20px;
 }
 
+.settings-row.is-disabled{
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 .settings-row{
   display:flex;
   flex-direction:column;
@@ -635,4 +640,312 @@ body{
   color:var(--text-dim);
   border-top:1px solid rgba(232,185,58,0.25);
   padding-top:12px;
+}
+
+/* ==========================================================================
+   CONTROLES DE CONDUCCIÓN — portado de GeoDrive (modo Ground Vehicle: d-pad
+   + pedales de gas/freno), re-skineado en dorado/negro para SantiagoGames.
+   ========================================================================== */
+#drivingControls{
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 40;
+}
+
+.steering-module{
+  position: absolute;
+  bottom: 30px;
+  left: 30px;
+  display: flex;
+  gap: 16px;
+  pointer-events: auto;
+}
+
+.d-pad-btn{
+  width: 76px;
+  height: 170px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2.2rem;
+  font-weight: bold;
+  color: var(--line);
+  background: rgba(27,27,24,0.72);
+  border: 2px solid rgba(232,185,58,0.55);
+  border-radius: 14px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  backdrop-filter: blur(2px);
+  transition: background 0.1s, border-color 0.1s;
+}
+.d-pad-btn:active,
+.d-pad-btn.is-pressed{
+  background: rgba(232,185,58,0.28);
+  border-color: var(--line);
+}
+
+.pedal-container{
+  position: absolute;
+  bottom: 30px;
+  right: 30px;
+  display: flex;
+  gap: 16px;
+  pointer-events: auto;
+}
+
+.pedal{
+  width: 84px;
+  height: 170px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+  font-size: 1rem;
+  letter-spacing: 0.06em;
+  color: var(--text);
+  border-radius: 14px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  backdrop-filter: blur(2px);
+  transition: background 0.1s, border-color 0.1s;
+}
+.pedal-gas{
+  background: rgba(58,138,74,0.30);
+  border: 2px solid rgba(90,200,110,0.55);
+}
+.pedal-gas:active,
+.pedal-gas.is-pressed{
+  background: rgba(58,138,74,0.6);
+  border-color: #8FE6A0;
+}
+.pedal-brake{
+  background: rgba(196,85,59,0.30);
+  border: 2px solid rgba(232,120,90,0.55);
+}
+.pedal-brake:active,
+.pedal-brake.is-pressed{
+  background: rgba(196,85,59,0.6);
+  border-color: #F0A088;
+}
+
+#speedReadout{
+  position: absolute;
+  bottom: 220px;
+  right: 30px;
+  pointer-events: none;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+  color: var(--line);
+  text-shadow: 0 1px 6px rgba(0,0,0,0.6);
+}
+#speedValue{
+  font-size: 2rem;
+  font-weight: 800;
+}
+.speed-unit{
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+@media (max-width: 640px){
+  .d-pad-btn{ width: 64px; height: 130px; font-size: 1.7rem; }
+  .pedal{ width: 68px; height: 130px; font-size: 0.85rem; }
+  .steering-module{ bottom: 16px; left: 16px; }
+  .pedal-container{ bottom: 16px; right: 16px; }
+  #speedReadout{ bottom: 160px; right: 16px; }
+}
+
+/* ==========================================================================
+   NAVEGACIÓN — buscador + minimapa, portado de GeoDrive (#gps-search /
+   #gps-minimap-*), re-skineado en dorado/negro.
+   ========================================================================== */
+#navSearchBar{
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  z-index: 45;
+  width: min(360px, 80vw);
+}
+#navSearchInput{
+  flex: 1;
+  padding: 9px 14px;
+  border-radius: 10px;
+  border: 1.5px solid rgba(232,185,58,0.5);
+  background: rgba(18,18,16,0.82);
+  color: var(--text);
+  font-size: 0.85rem;
+  outline: none;
+  backdrop-filter: blur(3px);
+}
+#navSearchInput::placeholder{ color: var(--text-dim); }
+#navSearchInput:focus{ border-color: var(--line); }
+#navSearchBtn{
+  width: 38px;
+  border-radius: 10px;
+  border: 1.5px solid rgba(232,185,58,0.5);
+  background: rgba(18,18,16,0.82);
+  color: var(--line);
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+#navSearchBtn:hover{ border-color: var(--line); background: rgba(232,185,58,0.15); }
+
+#navMinimapOverlay{
+  position: absolute;
+  top: 78px;
+  right: 20px;
+  width: 240px;
+  z-index: 44;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.6);
+  border: 1px solid rgba(232,185,58,0.4);
+  display: flex;
+  flex-direction: column;
+  transition: width 0.2s ease;
+}
+
+#navMinimapHeader{
+  background: rgba(18,18,16,0.95);
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid rgba(232,185,58,0.3);
+  cursor: grab;
+  touch-action: none;
+}
+#navMinimapHeader:active{ cursor: grabbing; }
+#navMinimapTitle{
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+#navMinimapDistWrap{
+  flex: 1;
+  text-align: right;
+  font-size: 0.75rem;
+  font-weight: 800;
+  color: var(--line);
+  font-variant-numeric: tabular-nums;
+}
+#navMinimapBtnMin{
+  width: 18px; height: 18px;
+  border-radius: 4px;
+  border: 1px solid rgba(232,185,58,0.4);
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+#navMinimapBtnMin:hover{ background: rgba(232,185,58,0.15); }
+
+#navMinimapOverlay.is-minimized #navMinimapViewport,
+#navMinimapOverlay.is-minimized #navMinimapFooter{ display: none !important; }
+#navMinimapOverlay.is-minimized{ width: 150px !important; }
+
+#navMinimapViewport{
+  position: relative;
+  width: 240px;
+  height: 190px;
+  overflow: hidden;
+  background: #0a0a08;
+}
+
+#navMinimap{
+  position: absolute;
+  width: 360px;
+  height: 360px;
+  top: -85px;
+  left: -60px;
+  transform-origin: center center;
+  transition: transform 0.12s linear;
+  will-change: transform;
+  filter: saturate(0.75) brightness(0.85) sepia(0.15) hue-rotate(-8deg);
+}
+#navMinimap .leaflet-control-container,
+#navMinimap .leaflet-bottom{ display: none !important; }
+
+#navMinimapResizeHandle{
+  position: absolute;
+  right: 4px; bottom: 4px;
+  width: 15px; height: 15px;
+  cursor: ns-resize;
+  opacity: 0.7;
+  z-index: 5;
+  touch-action: none;
+}
+#navMinimapResizeHandle svg{ width: 100%; height: 100%; pointer-events: none; }
+
+#navMinimapVehicle{
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -58%);
+  z-index: 900;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 5px rgba(0,0,0,0.7));
+}
+
+#navMinimapNorth{
+  position: absolute;
+  top: 6px; left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.6rem;
+  font-weight: 800;
+  color: #C4553B;
+  background: rgba(0,0,0,0.55);
+  padding: 1px 5px;
+  border-radius: 4px;
+  z-index: 900;
+  pointer-events: none;
+  letter-spacing: 0.05em;
+}
+
+#navMinimapFooter{
+  background: rgba(18,18,16,0.95);
+  padding: 5px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid rgba(232,185,58,0.25);
+  min-height: 26px;
+}
+#navMinimapDestLabel{
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+}
+#navMinimapZoomBtns{ display: flex; gap: 4px; }
+#navMinimapZoomBtns button{
+  width: 20px; height: 20px;
+  border-radius: 4px;
+  border: 1px solid rgba(232,185,58,0.4);
+  background: transparent;
+  color: var(--line);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+#navMinimapZoomBtns button:hover{ background: rgba(232,185,58,0.15); }
+
+@media (max-width: 640px){
+  #navMinimapOverlay{ top: 70px; right: 12px; width: 170px; }
+  #navMinimapViewport{ width: 170px; height: 135px; }
+  #navSearchBar{ width: 88vw; top: 12px; }
 }
