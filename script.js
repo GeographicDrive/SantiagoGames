@@ -1020,14 +1020,13 @@ function startRoadStreaming(){
   roadStreamTimerId = setInterval(() => {
     if (!audiEntity || !viewer) return;
 
-    const now = viewer.clock.currentTime;
-    const position = audiEntity.position.getValue(now);
-    if (!position) return;
-
-    const carto = Cesium.Cartographic.fromCartesian(position);
-    if (!carto) return;
-    const carLon = Cesium.Math.toDegrees(carto.longitude);
-    const carLat = Cesium.Math.toDegrees(carto.latitude);
+    // carState es la fuente de verdad de la posición del auto (audiEntity
+    // es solo su representación visual, actualizada a partir de carState
+    // en updateCarEntityAndCamera). Antes esto releía la posición desde la
+    // entidad de Cesium — getValue() + Cartesian3→Cartographic — un viaje
+    // de ida y vuelta innecesario para un dato que ya tenemos en grados.
+    const carLon = carState.lng;
+    const carLat = carState.lat;
     const { tx, ty } = tileCoordsForLonLat(carLon, carLat);
 
     if (tx === lastStreamCarTx && ty === lastStreamCarTy) return;
@@ -1217,9 +1216,11 @@ function updateCarEntityAndCamera(dt){
   }
   const groundHeight = _displayedGroundHeight;
   const carPosition = Cesium.Cartesian3.fromDegrees(carState.lng, carState.lat, groundHeight);
-  const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(carState.heading + MODEL_HEADING_OFFSET_DEG), 0, 0);
+  _tmpHprModel.heading = Cesium.Math.toRadians(carState.heading + MODEL_HEADING_OFFSET_DEG);
+  _tmpHprModel.pitch = 0;
+  _tmpHprModel.roll = 0;
   audiEntity.position = carPosition;
-  audiEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(carPosition, hpr);
+  audiEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(carPosition, _tmpHprModel);
 
   // Heading suavizado de la cámara (lag transversal — abre en curvas).
   const targetHeadingRad = Cesium.Math.toRadians(carState.heading);
@@ -1233,8 +1234,11 @@ function updateCarEntityAndCamera(dt){
     camSmoothHeadingRad += diff * headingAlpha;
   }
 
+  _tmpHprCam.heading = camSmoothHeadingRad;
+  _tmpHprCam.pitch = 0;
+  _tmpHprCam.roll = 0;
   const vehicleTransform = Cesium.Transforms.headingPitchRollToFixedFrame(
-    carPosition, new Cesium.HeadingPitchRoll(camSmoothHeadingRad, 0, 0)
+    carPosition, _tmpHprCam, Cesium.Ellipsoid.WGS84, undefined, _tmpVehicleTransform
   );
 
   // Offset de cámara en coordenadas polares (distancia/elevación/azimut)
@@ -1253,27 +1257,29 @@ function updateCarEntityAndCamera(dt){
   // lo que en GeoDrive mandaba la cámara "al espacio" al orbitar arriba.
   const el = Math.min(1.484, Math.max(0.04, baseEl + Cesium.Math.toRadians(freeLook.pitch)));
   const yawR = Cesium.Math.toRadians(freeLook.yaw);
-  const camOffset = new Cesium.Cartesian3(
-     orbitR * Math.cos(el) * Math.sin(yawR),   // x = derecha
-    -orbitR * Math.cos(el) * Math.cos(yawR),   // y = -adelante (detrás)
-     orbitR * Math.sin(el)                      // z = arriba
-  );
-  const camPos = Cesium.Matrix4.multiplyByPoint(vehicleTransform, camOffset, new Cesium.Cartesian3());
+  _tmpCamOffset.x = orbitR * Math.cos(el) * Math.sin(yawR);   // x = derecha
+  _tmpCamOffset.y = -orbitR * Math.cos(el) * Math.cos(yawR);  // y = -adelante (detrás)
+  _tmpCamOffset.z = orbitR * Math.sin(el);                    // z = arriba
+  const camPos = Cesium.Matrix4.multiplyByPoint(vehicleTransform, _tmpCamOffset, _tmpCamPos);
 
-  // FOV (GeoDrive: settings.fov) — se aplica cada frame al frustum de la
-  // cámara para que un cambio desde Configuración se note al instante.
-  if (viewer.scene.camera.frustum && typeof viewer.scene.camera.frustum.fov !== "undefined"){
+  // FOV (GeoDrive: settings.fov) — antes se reasignaba el frustum cada
+  // frame aunque el valor no hubiera cambiado; ahora solo se toca cuando
+  // gdSettings.fov difiere del último valor aplicado, pero sigue
+  // notándose al instante apenas cambia desde Configuración.
+  if (gdSettings.fov !== _lastAppliedFovDeg &&
+      viewer.scene.camera.frustum && typeof viewer.scene.camera.frustum.fov !== "undefined"){
     viewer.scene.camera.frustum.fov = Cesium.Math.toRadians(gdSettings.fov);
+    _lastAppliedFovDeg = gdSettings.fov;
   }
 
   // Apunta directo hacia el auto desde la posición de cámara calculada
   // (en vez de usar viewer.camera.lookAt, que deja la cámara "pegada" en
   // modo órbita) — así el drag/scroll del mouse para free-look sigue
   // disponible entre frames sin pelear con el chase cam.
-  const toCar = Cesium.Cartesian3.subtract(carPosition, camPos, new Cesium.Cartesian3());
+  const toCar = Cesium.Cartesian3.subtract(carPosition, camPos, _tmpToCar);
   const dist = Cesium.Cartesian3.magnitude(toCar);
   if (dist > 0.01){
-    const dir = Cesium.Cartesian3.normalize(toCar, new Cesium.Cartesian3());
+    const dir = Cesium.Cartesian3.normalize(toCar, _tmpDir);
 
     // ── Horizon blend (GeoDrive: settings.cameraLookBlend) ────────────
     // 0 = la cámara siempre mira al auto (default); 1 = mira derecho hacia
@@ -1281,9 +1287,11 @@ function updateCarEntityAndCamera(dt){
     // la cámara (look cinematográfico); valores intermedios mezclan ambas.
     if (gdSettings.cameraLookBlend > 0){
       const hRad = Cesium.Math.toRadians(carState.heading);
-      const localFwd = new Cesium.Cartesian3(Math.sin(hRad), Math.cos(hRad), 0);
-      const enuFrame = Cesium.Transforms.eastNorthUpToFixedFrame(camPos);
-      const worldFwd = Cesium.Matrix4.multiplyByPointAsVector(enuFrame, localFwd, new Cesium.Cartesian3());
+      _tmpLocalFwd.x = Math.sin(hRad);
+      _tmpLocalFwd.y = Math.cos(hRad);
+      _tmpLocalFwd.z = 0;
+      const enuFrame = Cesium.Transforms.eastNorthUpToFixedFrame(camPos, Cesium.Ellipsoid.WGS84, _tmpEnuFrame);
+      const worldFwd = Cesium.Matrix4.multiplyByPointAsVector(enuFrame, _tmpLocalFwd, _tmpWorldFwd);
       Cesium.Cartesian3.normalize(worldFwd, worldFwd);
       Cesium.Cartesian3.lerp(dir, worldFwd, gdSettings.cameraLookBlend, dir);
       Cesium.Cartesian3.normalize(dir, dir);
@@ -1294,13 +1302,36 @@ function updateCarEntityAndCamera(dt){
     // vuelta" y bamboleara al girar el heading. Se extrae la columna Z de
     // vehicleTransform (que ya es el frame ENU en carPosition) para que la
     // cámara quede siempre verticalmente paralela al terreno.
-    const localUp = Cesium.Matrix4.multiplyByPointAsVector(
-      vehicleTransform, new Cesium.Cartesian3(0, 0, 1), new Cesium.Cartesian3()
-    );
+    const localUp = Cesium.Matrix4.multiplyByPointAsVector(vehicleTransform, _tmpUpAxis, _tmpLocalUp);
     Cesium.Cartesian3.normalize(localUp, localUp);
     viewer.camera.setView({ destination: camPos, orientation: { direction: dir, up: localUp } });
   }
 }
+
+// ── Perf: objetos Cesium reutilizados en updateCarEntityAndCamera ────────
+// Antes se creaba un HeadingPitchRoll/Cartesian3 nuevo en cada llamada
+// (60-90 veces por segundo), generando presión de garbage collection sin
+// necesidad: estos valores se sobreescriben cada frame, así que un solo
+// objeto persistente reutilizado con los métodos "...ToResult" de Cesium
+// (que escriben en el objeto que les pasás en vez de crear uno nuevo)
+// evita esas asignaciones. Notorio sobre todo en móviles de gama media.
+const _tmpHprModel = new Cesium.HeadingPitchRoll();
+const _tmpHprCam = new Cesium.HeadingPitchRoll();
+const _tmpCamOffset = new Cesium.Cartesian3();
+const _tmpCamPos = new Cesium.Cartesian3();
+const _tmpToCar = new Cesium.Cartesian3();
+const _tmpDir = new Cesium.Cartesian3();
+const _tmpLocalFwd = new Cesium.Cartesian3();
+const _tmpWorldFwd = new Cesium.Cartesian3();
+const _tmpLocalUp = new Cesium.Cartesian3();
+const _tmpUpAxis = new Cesium.Cartesian3(0, 0, 1);
+const _tmpVehicleTransform = new Cesium.Matrix4();
+const _tmpEnuFrame = new Cesium.Matrix4();
+
+// Último FOV (en grados) efectivamente aplicado al frustum de la cámara.
+// Evita reasignar viewer.scene.camera.frustum.fov cada frame cuando el
+// valor de configuración no cambió desde el frame anterior.
+let _lastAppliedFovDeg = null;
 
 let _lastCarGroundHeight = null;   // última altura de terreno VALIDADA (target)
 let _pendingSpikeHeight = null;    // lectura atípica en espera de confirmación
@@ -1382,14 +1413,35 @@ function carAnimationLoop(timestampMs){
   const dt = Math.min(0.1, (timestampMs - carLastFrameTime) / 1000); // clamp: evita saltos si la pestaña estuvo en background
   carLastFrameTime = timestampMs;
 
+  const _tPhysicsStart = Profiler.enabled ? performance.now() : 0;
   updateCarPhysics(dt);
   updateFreeLookIdle(dt);
+  const _tCamStart = Profiler.enabled ? performance.now() : 0;
   updateCarEntityAndCamera(dt);
-  updateNavMap();
+  const _tCamEnd = Profiler.enabled ? performance.now() : 0;
   if (speedValueEl) speedValueEl.textContent = Math.round(Math.abs(carState.speed));
+
+  if (Profiler.enabled){
+    Profiler.recordFrame({
+      frameStartMs: timestampMs,
+      physicsMs: _tCamStart - _tPhysicsStart,
+      cameraMs: _tCamEnd - _tCamStart,
+    });
+  }
 
   carAnimFrameId = requestAnimationFrame(carAnimationLoop);
 }
+
+// Intervalo propio del minimapa (~100ms / 10Hz), independiente del
+// requestAnimationFrame de Cesium. updateNavMap() ya se auto-limitaba
+// internamente a 100ms (_navMapLastTick), pero seguía siendo *llamada*
+// hasta 90 veces por segundo desde el loop de render —cada llamada
+// entraba a la función, evaluaba el guard y retornaba, trabajo
+// desperdiciado en el hilo principal justo durante el frame de Cesium—.
+// Ahora directamente no se la invoca desde ahí: el propio setInterval
+// dicta su cadencia, así el minimapa nunca compite con el render.
+const NAV_MAP_UPDATE_INTERVAL_MS = 100;
+let _navMapTimerId = null;
 
 function startCarLoop(){
   if (carAnimFrameId !== null) return;
@@ -1397,6 +1449,9 @@ function startCarLoop(){
   carAnimFrameId = requestAnimationFrame(carAnimationLoop);
   if (_carGroundSampleTimerId === null){
     _carGroundSampleTimerId = setInterval(sampleCarGroundHeight, CAR_GROUND_SAMPLE_INTERVAL_MS);
+  }
+  if (_navMapTimerId === null){
+    _navMapTimerId = setInterval(updateNavMap, NAV_MAP_UPDATE_INTERVAL_MS);
   }
 }
 let _carGroundSampleTimerId = null;
@@ -1409,6 +1464,10 @@ function stopCarLoop(){
   if (_carGroundSampleTimerId !== null){
     clearInterval(_carGroundSampleTimerId);
     _carGroundSampleTimerId = null;
+  }
+  if (_navMapTimerId !== null){
+    clearInterval(_navMapTimerId);
+    _navMapTimerId = null;
   }
 }
 
@@ -1902,6 +1961,7 @@ function updateNavMap(){
   const now = performance.now();
   if (now - _navMapLastTick < 100) return;
   _navMapLastTick = now;
+  const _tMinimapStart = Profiler.enabled ? now : 0;
 
   navMap.setView([carState.lat, carState.lng], navMapCurrentZoom, { animate: false });
 
@@ -1956,6 +2016,9 @@ function updateNavMap(){
     }
     navRouteCoords = null;
     if (distEl) distEl.textContent = "—";
+  }
+  if (Profiler.enabled){
+    Profiler.recordMinimap(performance.now() - _tMinimapStart);
   }
 }
 
@@ -2139,6 +2202,163 @@ if (navZoomOutBtn) navZoomOutBtn.addEventListener("click", () => navMapZoom(-1))
   ["pointerup", "pointercancel"].forEach((ev) =>
     handle.addEventListener(ev, () => { resizing = false; }));
 })();
+
+// ══════════════════════════════════════════════════════════════════════
+// PROFILER — medición de rendimiento en dispositivo real (FPS, tiempos por
+// subsistema, spikes de frame time, memoria JS si el navegador la expone).
+// ══════════════════════════════════════════════════════════════════════
+// Diseño: un ring buffer liviano que se llena desde carAnimationLoop()
+// (physics + camera) y desde updateNavMap() (minimap), sin tocar la
+// lógica de esas funciones más allá de un par de performance.now(). El
+// overhead cuando está desactivado es un solo booleano chequeado ("if
+// (Profiler.enabled)"), así que en producción (panel oculto) el costo es
+// prácticamente cero. Se activa con la tecla F9 o llamando a
+// Profiler.enable() desde la consola.
+const Profiler = (() => {
+  const WINDOW = 120; // ~2s de historial a 60fps — suficiente para promedios estables sin gastar memoria
+  const SPIKE_THRESHOLD_MS = 33.3; // un frame más lento que ~30fps cuenta como spike
+
+  const frameTimes = new Float32Array(WINDOW);
+  const physicsTimes = new Float32Array(WINDOW);
+  const cameraTimes = new Float32Array(WINDOW);
+  let idx = 0;
+  let filled = 0;
+  let lastFrameStartMs = null;
+
+  let minimapMsEma = 0;   // el minimap corre a ~10Hz, no por frame: se promedia aparte con EMA
+  let minimapSamples = 0;
+
+  let spikeCount = 0;
+  let totalFrames = 0;
+  let worstFrameMs = 0;
+
+  let enabled = false;
+  let panelEl = null;
+  let rafPanelId = null;
+
+  function recordFrame({ frameStartMs, physicsMs, cameraMs }){
+    if (lastFrameStartMs !== null){
+      const frameMs = frameStartMs - lastFrameStartMs;
+      frameTimes[idx] = frameMs;
+      physicsTimes[idx] = physicsMs;
+      cameraTimes[idx] = cameraMs;
+      idx = (idx + 1) % WINDOW;
+      filled = Math.min(filled + 1, WINDOW);
+
+      totalFrames++;
+      if (frameMs > SPIKE_THRESHOLD_MS) spikeCount++;
+      if (frameMs > worstFrameMs) worstFrameMs = frameMs;
+    }
+    lastFrameStartMs = frameStartMs;
+  }
+
+  function recordMinimap(ms){
+    minimapSamples++;
+    // EMA simple: el minimap no corre por frame, así que no tiene sentido
+    // meterlo en el mismo ring buffer que physics/camera (frecuencias
+    // distintas). Alpha bajo = suaviza sin reaccionar de más a un pico único.
+    minimapMsEma = minimapSamples === 1 ? ms : minimapMsEma * 0.85 + ms * 0.15;
+  }
+
+  function avg(arr, n){
+    if (n === 0) return 0;
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += arr[i];
+    return sum / n;
+  }
+  function max(arr, n){
+    let m = 0;
+    for (let i = 0; i < n; i++) if (arr[i] > m) m = arr[i];
+    return m;
+  }
+
+  function stats(){
+    const n = filled;
+    const avgFrameMs = avg(frameTimes, n);
+    return {
+      fps: avgFrameMs > 0 ? 1000 / avgFrameMs : 0,
+      avgFrameMs,
+      maxFrameMs: max(frameTimes, n),
+      avgPhysicsMs: avg(physicsTimes, n),
+      avgCameraMs: avg(cameraTimes, n),
+      minimapMs: minimapMsEma,
+      spikeCount,
+      spikePct: totalFrames > 0 ? (spikeCount / totalFrames) * 100 : 0,
+      worstFrameMs,
+      totalFrames,
+      jsHeapMB: (performance.memory && performance.memory.usedJSHeapSize)
+        ? performance.memory.usedJSHeapSize / (1024 * 1024)
+        : null,
+    };
+  }
+
+  function ensurePanel(){
+    if (panelEl) return panelEl;
+    panelEl = document.createElement("div");
+    panelEl.id = "perfProfilerPanel";
+    Object.assign(panelEl.style, {
+      position: "fixed", top: "8px", right: "8px", zIndex: "10000",
+      background: "rgba(10,10,12,0.82)", color: "#8CF08C",
+      font: "11px/1.5 monospace", padding: "8px 10px", borderRadius: "6px",
+      border: "1px solid rgba(140,240,140,0.35)", whiteSpace: "pre",
+      pointerEvents: "none", backdropFilter: "blur(2px)",
+      minWidth: "200px",
+    });
+    document.body.appendChild(panelEl);
+    return panelEl;
+  }
+
+  function renderPanel(){
+    if (!enabled || !panelEl) return;
+    const s = stats();
+    const memLine = s.jsHeapMB !== null
+      ? `Heap JS:   ${s.jsHeapMB.toFixed(1)} MB\n`
+      : `Heap JS:   n/d (solo Chrome)\n`;
+    panelEl.textContent =
+      `── PROFILER (F9) ──\n` +
+      `FPS:       ${s.fps.toFixed(1)}\n` +
+      `Frame:     ${s.avgFrameMs.toFixed(2)} ms (max ${s.maxFrameMs.toFixed(1)})\n` +
+      `Física:    ${s.avgPhysicsMs.toFixed(3)} ms\n` +
+      `Cámara:    ${s.avgCameraMs.toFixed(3)} ms\n` +
+      `Minimapa:  ${s.minimapMs.toFixed(2)} ms\n` +
+      memLine +
+      `Spikes:    ${s.spikeCount}/${s.totalFrames} (${s.spikePct.toFixed(1)}%)\n` +
+      `Peor frame:${s.worstFrameMs.toFixed(1)} ms`;
+    rafPanelId = requestAnimationFrame(renderPanel);
+  }
+
+  function resetCounters(){
+    frameTimes.fill(0); physicsTimes.fill(0); cameraTimes.fill(0);
+    idx = 0; filled = 0; lastFrameStartMs = null;
+    minimapMsEma = 0; minimapSamples = 0;
+    spikeCount = 0; totalFrames = 0; worstFrameMs = 0;
+  }
+
+  function enable(){
+    if (enabled) return;
+    enabled = true;
+    resetCounters();
+    ensurePanel().style.display = "block";
+    rafPanelId = requestAnimationFrame(renderPanel);
+    console.log("[Profiler] activado (F9 para ocultar). Profiler.stats() también disponible en consola.");
+  }
+  function disable(){
+    enabled = false;
+    if (panelEl) panelEl.style.display = "none";
+    if (rafPanelId !== null){ cancelAnimationFrame(rafPanelId); rafPanelId = null; }
+  }
+  function toggle(){ enabled ? disable() : enable(); }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "F9"){ e.preventDefault(); toggle(); }
+  });
+
+  return {
+    get enabled(){ return enabled; },
+    recordFrame, recordMinimap, stats, enable, disable, toggle,
+  };
+})();
+window.Profiler = Profiler; // acceso rápido desde consola para debug en dispositivo
 
 console.log("[SantiagoGames] script.js — streaming de calles v2 (consulta única + progreso continuo)");
 
