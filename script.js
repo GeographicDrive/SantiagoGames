@@ -441,10 +441,6 @@ async function initSimulation(gameName){
     infoBox: false,
     selectionIndicator: false,
     globe: false,
-    // preserveDrawingBuffer: necesario para poder leer píxeles del canvas ya
-    // renderizado (gl.readPixels) — lo usa la "visión de calle por color"
-    // (ver isWorldPointStreet) para clasificar asfalto vs. no-asfalto sin
-    // depender de ningún dato descargado aparte.
     contextOptions: { webgl: { preserveDrawingBuffer: true } },
   });
 
@@ -512,11 +508,11 @@ async function initSimulation(gameName){
     hudStatus.textContent = "3D Tiles cargados — ubicando Audi Quattro…";
     await spawnAudiQuattro();
 
-    // Ya no hay streaming de calles que precargar: la detección de calle
-    // usa el color de los propios 3D Tiles ya renderizados (ver "VISIÓN DE
-    // CALLE POR COLOR"), así que este paso queda instantáneo — no hay
-    // ningún archivo que descargar ni tile que esperar antes de arrancar.
-    markStepDone("stepOsm", "Detección de calle por color (sin descargas).");
+    // La primera descarga de calles reales (Overpass) se dispara sola en
+    // el primer tick de updateStreetRepulsion (maybeRefreshRoadCache, ver
+    // "CALLES REALES VÍA OVERPASS"), así que este paso no bloquea el
+    // arranque — no hay que esperarla acá.
+    markStepDone("stepOsm", "Calles reales vía Overpass (GPS) activadas.");
 
     hideLoadingOverlay();
   } catch (error) {
@@ -527,152 +523,150 @@ async function initSimulation(gameName){
 }
 
 
-/* ===================== VISIÓN DE CALLE POR COLOR (sin descargas) =========
- * Reemplaza al viejo sistema de calles precomputadas (Overpass + archivos
- * data/tiles/*.json + scripts/fetch-roads.mjs, ya eliminados del proyecto):
- * en vez de necesitar datos viales descargados aparte, el auto "mira" el
- * canvas que Cesium YA está renderizando (los 3D Tiles fotorrealistas) y
- * clasifica cada punto que le interesa como calle o no-calle según el
- * COLOR con el que se ve ahí — el asfalto/concreto es gris, poco saturado
- * y de brillo medio; pasto, tejas, autos, techos, etc. no lo son. Es un
- * heurístico de visión, no una fuente de verdad exacta como sería un mapa
- * vectorial real, pero no requiere ningún archivo ni conexión a APIs
- * externas: solo lo que la cámara ya está dibujando.
+/* ===================== CALLES REALES VÍA OVERPASS (GPS) =================
+ * En vez de "mirar" el color de lo renderizado, esto pide a la API de
+ * Overpass (mismo backend que usan las apps de OSM, sin API key) la
+ * geometría REAL de las calles en un radio razonable alrededor del auto —
+ * igual que el propio minimapa de navegación (sección "NAVEGACIÓN") ya usa
+ * OSRM/Nominatim para rutas/direcciones. Con esa geometría se arma una
+ * lista de segmentos (par de puntos XY locales) y cada frame se busca el
+ * segmento MÁS CERCANO al auto: su distancia perpendicular dice si el auto
+ * está "en la calle" (dentro del semiancho de calzada asumido) y su
+ * tangente da la dirección real de esa calle, para poder no solo apuntar
+ * HACIA la calle sino además alinearse y mantenerse EN ELLA (seguir el
+ * carril), que es lo que pedía el usuario en vez del barrido de sensores
+ * por color.
  *
- * Cómo se "mira" un punto del mundo (isWorldPointStreet):
- *   1) Se calcula su lon/lat (a partir de XY local) y se le asigna la
- *      última altura de terreno conocida del auto (_lastCarGroundHeight)
- *      como aproximación — suficiente para puntos cercanos (unas pocas
- *      decenas de metros), que es todo lo que necesita el autopilot.
- *   2) Se proyecta ese punto 3D a coordenadas de pantalla con
- *      Cesium.SceneTransforms.worldToWindowCoordinates. Si el punto queda
- *      fuera de cámara (detrás, o fuera del viewport), no hay nada que
- *      leer: se devuelve null ("sin dato"), nunca se inventa una
- *      clasificación.
- *   3) Se lee el color de ESE píxel ya renderizado directo del framebuffer
- *      de WebGL (gl.readPixels) — requiere que el Viewer se haya creado
- *      con contextOptions.webgl.preserveDrawingBuffer=true (ver
- *      initSimulation) para que el buffer no se borre antes de poder leerlo.
- *   4) Se clasifica ese color con isAsphaltColor.
- *
- * Rendimiento: cada lectura es un solo texel (gl.readPixels de 1×1), muy
- * barata individualmente. El chequeo del propio punto del auto se hace
- * cada frame; el barrido de sensores alrededor (findNearestStreetByColor)
- * es más caro (varias decenas de lecturas) así que solo se dispara cuando
- * el auto YA está fuera de la calle, no todo el tiempo.
+ * Caché: la consulta a Overpass es relativamente cara y tiene límites de
+ * uso, así que no se pide cada frame. Se pide una vez al spawnear y cada
+ * vez que el auto se aleja más de ROAD_REFETCH_TRIGGER_M del centro de la
+ * última descarga (ver maybeRefreshRoadCache). Mientras una descarga está
+ * en curso se sigue usando la caché anterior — nunca se bloquea el frame.
  */
 
-// Radio máximo (m) en el que el autopilot "busca" calle a su alrededor
-// antes de rendirse y no corregir nada ese frame.
+// Radio (m) de calles a pedir a Overpass alrededor del auto cada vez que
+// se refresca la caché. Debe ser bastante mayor que ROAD_REFETCH_TRIGGER_M
+// para que el auto tenga margen de sobra antes de quedarse sin datos.
+const ROAD_FETCH_RADIUS_METERS = 400;
+// Cuánto se puede alejar el auto del centro de la última descarga antes de
+// disparar una nueva (evita repedir Overpass cada pocos metros).
+const ROAD_REFETCH_TRIGGER_METERS = 150;
+// Tipos de "highway" de OSM que NO cuentan como calle para autos (veredas,
+// senderos, ciclovías, etc.) — se excluyen directo en la query Overpass.
+const ROAD_EXCLUDED_HIGHWAY_TYPES =
+  "footway|path|steps|cycleway|pedestrian|track|bridleway|proposed|construction|elevator|corridor|platform|raceway";
+// Semiancho (m) de calzada asumido: si el auto está a menos de esto del
+// segmento más cercano, se considera "en la calle" y no se corrige nada.
+const STREET_HALF_WIDTH_METERS = 5;
+// Igual que antes: radio "de sensor" usado para escalar qué tan fuerte
+// corrige el autopilot cuanto más lejos está el auto de la calle más
+// cercana conocida.
 const STREET_VISION_SEARCH_RADIUS_METERS = 30;
-// Anillos de distancia (m) que se van probando, de más cerca a más lejos —
-// apenas uno da con un texel "calle" en algún ángulo, se usa ese (no hace
-// falta seguir buscando más lejos).
-const STREET_VISION_RINGS_METERS = [4, 8, 13, 20, 30];
-// Cuántas direcciones se prueban en cada anillo (cada 360/N grados).
-const STREET_VISION_ANGLES_PER_RING = 16;
 
-// Umbrales de clasificación de color "asfalto/concreto": poco saturado
-// (gris, no un color vivo) y ni muy oscuro (sombra dura/negro) ni muy
-// claro (línea de pintura vial muy expuesta al sol/cielo de fondo).
-const STREET_VISION_MAX_SATURATION = 0.22;
-const STREET_VISION_MIN_BRIGHTNESS = 0.10;
-const STREET_VISION_MAX_BRIGHTNESS = 0.82;
+let roadSegments = [];        // [{x1,y1,x2,y2,wayId}, ...] en XY local (metros)
+let roadCacheCenterXY = null; // {x,y} del centro de la última descarga OK
+let roadFetchInFlight = false;
+let currentWayId = null;      // wayId del segmento al que el auto está "pegado" (para no saltar de calle en cada cruce)
 
-let _streetVisionGL = null; // contexto WebGL cacheado, para no re-pedirlo cada lectura
-function _getStreetVisionGL(){
-  if (_streetVisionGL || !viewer) return _streetVisionGL;
-  const canvas = viewer.canvas;
-  // Volver a pedir el mismo tipo de contexto que ya usa Cesium en este
-  // canvas devuelve el contexto EXISTENTE (un canvas solo puede tener uno);
-  // no se crea ningún contexto nuevo ni se interfiere con el render.
-  _streetVisionGL = canvas.getContext("webgl2") || canvas.getContext("webgl");
-  return _streetVisionGL;
-}
-
-const _streetVisionPixelBuf = new Uint8Array(4);
-
-/** isAsphaltColor — clasifica un color RGB (0..255) como "calle" o no,
- * según saturación y brillo (ver constantes STREET_VISION_* arriba). */
-function isAsphaltColor(r, g, b){
-  const rn = r / 255, gn = g / 255, bn = b / 255;
-  const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn);
-  const saturation = max <= 0 ? 0 : (max - min) / max;
-  const brightness = max;
-  return saturation <= STREET_VISION_MAX_SATURATION &&
-         brightness >= STREET_VISION_MIN_BRIGHTNESS &&
-         brightness <= STREET_VISION_MAX_BRIGHTNESS;
-}
-
-/** isWorldPointStreet — ver cabecera de sección. true/false = clasificado,
- * null = no se pudo leer ese punto (fuera de cámara o sin altura de
- * referencia todavía). */
-function isWorldPointStreet(worldX, worldY){
-  if (!viewer || _lastCarGroundHeight === null) return null;
-  const gl = _getStreetVisionGL();
-  if (!gl) return null;
-
-  const { lon, lat } = localXYToLonLat(worldX, worldY);
-  const cartesian = Cesium.Cartesian3.fromDegrees(lon, lat, _lastCarGroundHeight);
-  const screenPos = Cesium.SceneTransforms.worldToWindowCoordinates(viewer.scene, cartesian);
-  if (!screenPos || !isFinite(screenPos.x) || !isFinite(screenPos.y)) return null;
-
-  // screenPos viene en píxeles CSS (canvas.clientWidth/Height), pero el
-  // framebuffer real que hay que leer con gl.readPixels puede tener un
-  // tamaño DISTINTO: no solo por devicePixelRatio, sino también por
-  // viewer.resolutionScale (gdSettings.resolutionScale, 0.5 por defecto
-  // para rendimiento) y por cualquier otro escalado interno de Cesium. Usar
-  // solo devicePixelRatio para convertir (como se hacía antes) asumía
-  // resolutionScale=1 y el punto calculado quedaba casi siempre fuera del
-  // buffer real → por eso isWorldPointStreet devolvía "sin datos" (null)
-  // todo el tiempo. La conversión correcta es la razón real entre el
-  // tamaño del framebuffer y el tamaño CSS del canvas, medida en vivo.
-  const canvas = viewer.canvas;
-  if (!canvas.clientWidth || !canvas.clientHeight) return null; // canvas aún sin layout (frame inicial)
-  const scaleX = gl.drawingBufferWidth / canvas.clientWidth;
-  const scaleY = gl.drawingBufferHeight / canvas.clientHeight;
-  const px = Math.round(screenPos.x * scaleX);
-  // WebGL lee el framebuffer con origen abajo-izquierda; las coordenadas de
-  // pantalla de Cesium tienen origen arriba-izquierda: hay que invertir Y.
-  const py = Math.round(gl.drawingBufferHeight - screenPos.y * scaleY);
-  if (px < 0 || py < 0 || px >= gl.drawingBufferWidth || py >= gl.drawingBufferHeight) return null;
-
+/**
+ * fetchNearbyRoads — pide a Overpass todas las "ways" con highway=* dentro
+ * de ROAD_FETCH_RADIUS_METERS de (lat,lon) y las vuelca a roadSegments como
+ * segmentos XY locales. No lanza si falla (sin conexión, rate-limit, etc.):
+ * loguea un warning y deja la caché anterior intacta, igual que el resto
+ * de las llamadas a APIs externas del proyecto (OSRM/Nominatim).
+ */
+async function fetchNearbyRoads(lat, lon){
+  if (roadFetchInFlight) return;
+  roadFetchInFlight = true;
   try {
-    gl.readPixels(px, py, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, _streetVisionPixelBuf);
+    const query = `[out:json][timeout:15];way["highway"]["highway"!~"^(${ROAD_EXCLUDED_HIGHWAY_TYPES})$"]["area"!="yes"](around:${ROAD_FETCH_RADIUS_METERS},${lat},${lon});out geom;`;
+    const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Overpass HTTP ${res.status}`);
+    const data = await res.json();
+
+    const segments = [];
+    for (const el of (data.elements || [])){
+      if (el.type !== "way" || !Array.isArray(el.geometry) || el.geometry.length < 2) continue;
+      let prev = null;
+      for (const node of el.geometry){
+        if (typeof node.lat !== "number" || typeof node.lon !== "number") { prev = null; continue; }
+        const { x, y } = lonLatToLocalXY(node.lon, node.lat);
+        if (prev) segments.push({ x1: prev.x, y1: prev.y, x2: x, y2: y, wayId: el.id });
+        prev = { x, y };
+      }
+    }
+
+    // Solo se reemplaza la caché si Overpass devolvió algo utilizable; una
+    // respuesta vacía (p.ej. zona sin datos de OSM) no debería borrar la
+    // caché previa que sí guiaba al autopilot.
+    if (segments.length > 0){
+      roadSegments = segments;
+      roadCacheCenterXY = lonLatToLocalXY(lon, lat);
+    }
   } catch (e) {
-    return null; // contexto perdido u otro error de lectura puntual: sin dato, no se rompe el frame
+    console.warn("Overpass (calles cercanas) falló, se mantiene la caché anterior:", e);
+  } finally {
+    roadFetchInFlight = false;
   }
-  return isAsphaltColor(_streetVisionPixelBuf[0], _streetVisionPixelBuf[1], _streetVisionPixelBuf[2]);
+}
+
+/** maybeRefreshRoadCache — dispara fetchNearbyRoads cuando todavía no hay
+ * caché, o cuando el auto se alejó más de ROAD_REFETCH_TRIGGER_METERS del
+ * centro de la última descarga. Nunca bloquea: es fire-and-forget. */
+function maybeRefreshRoadCache(carX, carY){
+  if (roadFetchInFlight) return;
+  const needsFetch = !roadCacheCenterXY ||
+    Math.hypot(carX - roadCacheCenterXY.x, carY - roadCacheCenterXY.y) > ROAD_REFETCH_TRIGGER_METERS;
+  if (!needsFetch) return;
+  const { lon, lat } = localXYToLonLat(carX, carY);
+  fetchNearbyRoads(lat, lon);
+}
+
+/** closestPointOnSegment — proyección de (px,py) sobre el segmento
+ * (x1,y1)-(x2,y2), clampeada a los extremos. Devuelve {x,y,t,dist}. */
+function closestPointOnSegment(px, py, x1, y1, x2, y2){
+  const dx = x2 - x1, dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq > 0 ? ((px - x1) * dx + (py - y1) * dy) / lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  const x = x1 + dx * t, y = y1 + dy * t;
+  return { x, y, t, dist: Math.hypot(px - x, py - y) };
 }
 
 /**
- * findNearestStreetByColor — barrido tipo "sensores" alrededor de (carX,
- * carY): prueba anillos de radio creciente (STREET_VISION_RINGS_METERS),
- * y en cada anillo varias direcciones (STREET_VISION_ANGLES_PER_RING),
- * hasta encontrar el primer punto que isWorldPointStreet clasifique como
- * calle. Es la versión "por visión" del viejo findNearestRoadSurface: no
- * da un semiancho de vía real ni una tangente exacta (eso requeriría datos
- * vectoriales), así que el autopilot que lo usa solo puede dirigir el
- * heading HACIA el punto encontrado, sin el afinado de "seguir el carril"
- * que sí tenía el sistema anterior basado en OSM.
+ * findNearestRoadSegment — recorre roadSegments (la caché de Overpass) y
+ * devuelve el segmento más cercano a (carX,carY): { dist, projX, projY,
+ * dirX, dirY, wayId }, donde dirX/dirY es la tangente unitaria del
+ * segmento (dirección de la calle en ese punto, con signo arbitrario — se
+ * resuelve el signo correcto en updateStreetRepulsion según hacia dónde ya
+ * viene apuntando el auto). Devuelve null si la caché todavía está vacía
+ * (p.ej. justo al spawnear, antes de que responda el primer fetch).
  *
- * Devuelve { distance, dirX, dirY } (dirección unitaria hacia el punto
- * encontrado) o null si no se encontró ninguna calle dentro del radio de
- * búsqueda (p.ej. cámara mirando muy arriba, o realmente no hay calle
- * cerca).
+ * Para no "saltar" de calle en cada cruce (p.ej. quedar zigzageando entre
+ * la calle por la que viene el auto y una transversal apenas más cerca en
+ * la esquina), los segmentos que pertenecen a currentWayId (la calle a la
+ * que el auto ya estaba pegado el frame anterior) reciben un pequeño bonus
+ * de distancia — deben verse claramente más cerca los de OTRA calle antes
+ * de que el autopilot cambie de referencia.
  */
-function findNearestStreetByColor(carX, carY){
-  for (const radius of STREET_VISION_RINGS_METERS){
-    for (let i = 0; i < STREET_VISION_ANGLES_PER_RING; i++){
-      const angle = (i / STREET_VISION_ANGLES_PER_RING) * Math.PI * 2;
-      const dirX = Math.sin(angle), dirY = Math.cos(angle); // 0 = norte(+Y), 90° = este(+X)
-      const px = carX + dirX * radius, py = carY + dirY * radius;
-      if (isWorldPointStreet(px, py) === true){
-        return { distance: radius, dirX, dirY };
-      }
+const CURRENT_WAY_STICKINESS_METERS = 3;
+function findNearestRoadSegment(carX, carY){
+  if (roadSegments.length === 0) return null;
+  let best = null;
+  for (const seg of roadSegments){
+    const p = closestPointOnSegment(carX, carY, seg.x1, seg.y1, seg.x2, seg.y2);
+    const effectiveDist = seg.wayId === currentWayId ? Math.max(0, p.dist - CURRENT_WAY_STICKINESS_METERS) : p.dist;
+    if (!best || effectiveDist < best.effectiveDist){
+      const dx = seg.x2 - seg.x1, dy = seg.y2 - seg.y1;
+      const len = Math.hypot(dx, dy) || 1;
+      best = {
+        effectiveDist, dist: p.dist, projX: p.x, projY: p.y,
+        dirX: dx / len, dirY: dy / len, wayId: seg.wayId,
+      };
     }
   }
-  return null;
+  return best;
 }
 
 // Velocidad angular máxima (°/s) con la que el autopilot puede corregir el
@@ -685,57 +679,82 @@ const STREET_AUTOPILOT_MIN_TRACTION_KMH = 18;
 
 /**
  * updateStreetRepulsion — "autopilot de calle" que mantiene al auto sobre
- * la superficie vial. Se llama una vez por frame, DESPUÉS de
- * updateCarPhysics (que ya movió carState según input/heading) y ANTES de
- * updateCarEntityAndCamera (que renderiza esa posición).
+ * la calle real más cercana (datos de OSM vía Overpass, ver sección de
+ * arriba). Se llama una vez por frame, DESPUÉS de updateCarPhysics (que ya
+ * movió carState según input/heading) y ANTES de updateCarEntityAndCamera
+ * (que renderiza esa posición).
  *
- * Igual que antes: NUNCA toca la posición del auto directamente, solo
- * corrige carState.heading (y da tracción mínima si el auto está casi
- * detenido) para que sea el propio auto, con su física normal de
- * updateCarPhysics, el que se redirija de vuelta al carril. Lo único que
- * cambió es CÓMO detecta dónde está la calle: ya no consulta datos OSM
- * precomputados, "mira" el color de lo ya renderizado (ver sección
- * "VISIÓN DE CALLE POR COLOR" arriba).
+ * Nunca toca la posición del auto directamente: solo corrige
+ * carState.heading (y da tracción mínima si el auto está casi detenido)
+ * para que sea el propio auto, con su física normal, el que se redirija de
+ * vuelta al carril. El heading deseado combina dos cosas —igual que un
+ * "seek + align" de steering behaviors clásico—: (a) la dirección hacia el
+ * punto más cercano SOBRE la calle (para volver a ella), y (b) la tangente
+ * de esa calle en ese punto (para terminar alineado y seguirla, no solo
+ * tocarla y desviarse de nuevo). Cuanto más lejos está el auto de la
+ * calzada, más pesa (a); cuanto más cerca, más pesa (b).
  *
  * gdSettings.streetRepulsion (0..1 = slider "Repulsión de calles" 0%-100%):
  *   0%   → esta función retorna de inmediato sin tocar carState: el auto
  *          puede salir completamente de las calles y el heading es 100%
  *          manual.
  *   50%  → corrección moderada.
- *   100% → corrección casi inmediata apenas el color bajo el auto deja de
- *          verse como calle.
+ *   100% → corrección casi inmediata apenas el auto sale del semiancho de
+ *          calzada asumido (STREET_HALF_WIDTH_METERS).
  */
 function updateStreetRepulsion(dt){
+  const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
+  maybeRefreshRoadCache(carX, carY);
+
   const intensity = gdSettings.streetRepulsion;
   if ((!intensity || intensity <= 0) && !gdSettings.repulsionDebug) return;
 
-  const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
-  const onStreet = isWorldPointStreet(carX, carY);
-  if (onStreet === null){
-    updateRepulsionDebugState(null); // sin dato todavía (p.ej. justo al spawnear, o fuera de cámara)
+  const nearest = findNearestRoadSegment(carX, carY);
+  if (!nearest){
+    updateRepulsionDebugState(null); // todavía sin caché de Overpass (p.ej. recién spawneado)
     return;
   }
 
+  const onStreet = nearest.dist <= STREET_HALF_WIDTH_METERS;
   const repulsionWillAct = !onStreet && intensity > 0;
   updateRepulsionDebugState(onStreet, repulsionWillAct);
+  if (onStreet) currentWayId = nearest.wayId; // sobre la calle: confirmar/actualizar a qué calle está pegado
 
   if (!intensity || intensity <= 0) return; // debug-only: sin intensidad, no se corrige nada
-  if (onStreet) return; // el color bajo el auto ya se ve como calle: autopilot no interviene
+  if (onStreet) return; // dentro del semiancho de calzada: autopilot no interviene
 
-  const target = findNearestStreetByColor(carX, carY);
-  if (!target) return; // no se encontró calle en el radio de sensores este frame; no se corrige a ciegas
+  currentWayId = nearest.wayId; // fuera de la calle: apuntar a volver a ESTA calle (la más cercana)
 
-  // Cuanto más lejos hubo que buscar para encontrar calle, más "perdido"
-  // está el auto y más fuerte corrige — análogo al "excess" del sistema
-  // anterior, pero medido en anillos de sensor en vez de distancia real al
-  // borde de calzada.
-  const strength = Math.pow(Math.min(1, target.distance / STREET_VISION_SEARCH_RADIUS_METERS), 0.6);
+  // Cuanto más lejos está el auto de la calle más cercana, más "perdido"
+  // está y más fuerte corrige (mismo escalado que antes, ahora sobre
+  // distancia real en vez de anillos de sensor).
+  const strength = Math.pow(Math.min(1, nearest.dist / STREET_VISION_SEARCH_RADIUS_METERS), 0.6);
 
-  // Heading deseado: directo hacia el punto de calle encontrado (sin
-  // tangente disponible, a diferencia del sistema OSM anterior — ver nota
-  // en findNearestStreetByColor). Sigue siendo un giro acotado en
-  // velocidad, nunca un salto instantáneo de heading.
-  const desiredHeadingDeg = (Cesium.Math.toDegrees(Math.atan2(target.dirX, target.dirY)) + 360) % 360;
+  // (a) Dirección de "volver a la calle": hacia el punto más cercano SOBRE
+  // el segmento.
+  const seekDx = nearest.projX - carX, seekDy = nearest.projY - carY;
+  const seekLen = Math.hypot(seekDx, seekDy) || 1;
+  const seekX = seekDx / seekLen, seekY = seekDy / seekLen;
+
+  // (b) Tangente de la calle en ese punto, con el signo que mejor coincide
+  // con el heading actual del auto (así no lo hace "girar en U" solo
+  // porque el segmento se guardó en el sentido contrario).
+  const headingRad = Cesium.Math.toRadians(carState.heading);
+  const fwdX = Math.sin(headingRad), fwdY = Math.cos(headingRad); // 0°=norte(+Y), 90°=este(+X)
+  const alignSign = (fwdX * nearest.dirX + fwdY * nearest.dirY) >= 0 ? 1 : -1;
+  const alignX = nearest.dirX * alignSign, alignY = nearest.dirY * alignSign;
+
+  // Blend: más lejos de la calle → pesa más "volver" (seek); más cerca →
+  // pesa más "seguir la calle" (align). weightAlign va de ~0.25 (recién
+  // saliéndose) a ~0.75 (casi de vuelta en el borde).
+  const weightAlign = 0.25 + 0.5 * (1 - strength);
+  let desiredX = seekX * (1 - weightAlign) + alignX * weightAlign;
+  let desiredY = seekY * (1 - weightAlign) + alignY * weightAlign;
+  const desiredLen = Math.hypot(desiredX, desiredY);
+  if (desiredLen > 1e-6){ desiredX /= desiredLen; desiredY /= desiredLen; }
+  else { desiredX = seekX; desiredY = seekY; }
+
+  const desiredHeadingDeg = (Cesium.Math.toDegrees(Math.atan2(desiredX, desiredY)) + 360) % 360;
   let diff = ((desiredHeadingDeg - carState.heading + 540) % 360) - 180; // en (-180, 180]
   const maxTurnThisFrame = STREET_AUTOPILOT_MAX_TURN_DEG_S * intensity * strength * dt;
   const turnStep = Math.max(-maxTurnThisFrame, Math.min(maxTurnThisFrame, diff));
@@ -1614,13 +1633,13 @@ const REPULSION_DEBUG_GRID_RADIUS_M = 40;   // radio de muestreo alrededor del a
                                              // que el radio de búsqueda del autopilot en sí)
 
 /** updateRepulsionDebugOverlay — mientras gdSettings.repulsionDebug está
- * activo, muestrea una grilla de puntos alrededor del auto y pinta en rojo,
- * directamente sobre el minimapa Leaflet, cada celda que la visión por
- * color (isWorldPointStreet) clasifica como NO-calle. Las celdas que caen
- * fuera de cámara (sin dato, isWorldPointStreet devuelve null) no se
- * pintan — no hay evidencia de que sean calle o no, así que no se afirma
- * nada. El overlay siempre coincide exactamente con lo que "ve" el
- * autopilot, porque usa la misma función. */
+ * activo, dibuja sobre el minimapa Leaflet la caché de calles reales de
+ * Overpass que está usando el autopilot ahora mismo (roadSegments, en
+ * celeste) y, si el auto está fuera del semiancho de calzada asumido, una
+ * línea roja desde el auto hasta el punto de la calle más cercana al que
+ * está corrigiendo (nearest.projX/projY). Así el overlay siempre coincide
+ * exactamente con lo que "ve" el autopilot, porque usa las mismas
+ * funciones (findNearestRoadSegment). */
 function updateRepulsionDebugOverlay(){
   if (!navMap) return;
 
@@ -1642,24 +1661,33 @@ function updateRepulsionDebugOverlay(){
   repulsionDebugLayer.clearLayers();
 
   const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
-  const step = REPULSION_DEBUG_GRID_SPACING_M;
   const R = REPULSION_DEBUG_GRID_RADIUS_M;
 
-  for (let gx = -R; gx <= R; gx += step){
-    for (let gy = -R; gy <= R; gy += step){
-      const px = carX + gx, py = carY + gy;
-      const onStreet = isWorldPointStreet(px, py);
-      if (onStreet !== false) continue; // solo se pinta lo confirmado NO-calle (true=calle, null=sin dato)
+  // Calles cargadas (caché de Overpass), solo las que caen cerca del auto
+  // para no recargar el minimapa con toda la caché (que puede cubrir
+  // ROAD_FETCH_RADIUS_METERS, bastante más grande que R).
+  for (const seg of roadSegments){
+    const midX = (seg.x1 + seg.x2) / 2, midY = (seg.y1 + seg.y2) / 2;
+    if (Math.hypot(midX - carX, midY - carY) > R) continue;
+    const p1 = localXYToLonLat(seg.x1, seg.y1);
+    const p2 = localXYToLonLat(seg.x2, seg.y2);
+    L.polyline([[p1.lat, p1.lon], [p2.lat, p2.lon]], {
+      color: seg.wayId === currentWayId ? "#39d6ff" : "#39d6ff88",
+      weight: seg.wayId === currentWayId ? 3 : 2,
+      interactive: false,
+    }).addTo(repulsionDebugLayer);
+  }
 
-      const { lon, lat } = localXYToLonLat(px, py);
-      L.circleMarker([lat, lon], {
-        radius: 3,
-        stroke: false,
-        fillColor: "#ff2b2b",
-        fillOpacity: 0.55,
-        interactive: false,
-      }).addTo(repulsionDebugLayer);
-    }
+  const nearest = findNearestRoadSegment(carX, carY);
+  if (nearest && nearest.dist > STREET_HALF_WIDTH_METERS){
+    const carLL = localXYToLonLat(carX, carY);
+    const projLL = localXYToLonLat(nearest.projX, nearest.projY);
+    L.polyline([[carLL.lat, carLL.lon], [projLL.lat, projLL.lon]], {
+      color: "#ff2b2b",
+      weight: 2,
+      dashArray: "3,5",
+      interactive: false,
+    }).addTo(repulsionDebugLayer);
   }
 }
 
