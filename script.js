@@ -239,9 +239,9 @@ function yieldToMain(){
  * simplemente se resuelve con null pasado el timeout, para que quien llama
  * pueda seguir (usando una altura de respaldo) en vez de trabarse.
  */
-function sampleHeightMostDetailedSafe(positions, timeoutMs = 8000){
+function sampleHeightMostDetailedSafe(positions, timeoutMs = 8000, objectsToExclude){
   return Promise.race([
-    viewer.scene.sampleHeightMostDetailed(positions),
+    viewer.scene.sampleHeightMostDetailed(positions, objectsToExclude),
     new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
   ]).catch(() => null);
 }
@@ -1092,8 +1092,17 @@ function updateCarEntityAndCamera(dt){
   const dist = Cesium.Cartesian3.magnitude(toCar);
   if (dist > 0.01){
     const dir = Cesium.Cartesian3.normalize(toCar, new Cesium.Cartesian3());
-    const up = new Cesium.Cartesian3(0, 0, 1);
-    viewer.camera.setView({ destination: camPos, orientation: { direction: dir, up } });
+    // "Up" LOCAL (ENU) en la posición del auto, no el eje Z global del
+    // planeta: en latitudes como Santiago (-33°) ambos difieren bastante,
+    // y usar el up global hacía que la cámara se viera rotada/"dada
+    // vuelta" y bamboleara al girar el heading. Se extrae la columna Z de
+    // vehicleTransform (que ya es el frame ENU en carPosition) para que la
+    // cámara quede siempre verticalmente paralela al terreno.
+    const localUp = Cesium.Matrix4.multiplyByPointAsVector(
+      vehicleTransform, new Cesium.Cartesian3(0, 0, 1), new Cesium.Cartesian3()
+    );
+    Cesium.Cartesian3.normalize(localUp, localUp);
+    viewer.camera.setView({ destination: camPos, orientation: { direction: dir, up: localUp } });
   }
 }
 
@@ -1111,7 +1120,13 @@ async function sampleCarGroundHeight(){
   _carGroundSampleInFlight = true;
   try {
     const carto = Cesium.Cartographic.fromDegrees(carState.lng, carState.lat);
-    const sampled = await sampleHeightMostDetailedSafe(carto ? [carto] : []);
+    // Se excluye al propio audiEntity del muestreo: sin esto, cada 400ms el
+    // rayo podía "pisar" el techo del propio modelo del auto en vez del
+    // suelo real, y como la altura resultante se usa para reposicionar el
+    // auto, el error se iba acumulando ciclo a ciclo — el auto quedaba
+    // subiendo solo de a poco mientras estaba detenido (o incluso andando).
+    const excluded = audiEntity ? [audiEntity] : [];
+    const sampled = await sampleHeightMostDetailedSafe(carto ? [carto] : [], undefined, excluded);
     if (sampled && sampled[0] && isFinite(sampled[0].height)){
       _lastCarGroundHeight = sampled[0].height;
     }
