@@ -341,6 +341,11 @@ const gdSettings = {
                              // devicePixelRatio completo (2x+ píxeles reales) — bajarlo a
                              // 0.75 por defecto corta bastante carga de GPU con una pérdida
                              // de nitidez menor. Subible a 1.0 desde Configuración.
+  steeringSensitivity: 1.0, // Multiplicador de CAR.baseTurnRate — ajustable desde Configuración.
+  cameraHeight: 3.8,        // Metros de altura de la cámara sobre el auto (CAMERA_UP_METERS).
+                             // Subirla aleja la cámara de las mallas fotorrealistas cercanas
+                             // (veredas, vehículos estacionados, postes) que de muy cerca se
+                             // ven "dobladas"/distorsionadas por artefactos de fotogrametría.
 };
 
 // Optimizaciones automáticas de GeoDrive que permanecen SIEMPRE activas,
@@ -426,6 +431,22 @@ async function initSimulation(gameName){
   viewer.scene.skyAtmosphere.show = false;
   viewer.scene.fog.enabled = false;
   viewer.scene.backgroundColor = Cesium.Color.fromCssColorString("#121210");
+
+  // Ambiente de DÍA fijo: sin esto, Cesium calcula la posición del sol con
+  // la hora real del sistema (viewer.clock.currentTime = "ahora"), así que
+  // de noche en Chile los 3D Tiles fotorrealistas (que sí reaccionan a la
+  // dirección de la luz) se ven oscuros/nocturnos. Se fija el reloj a un
+  // mediodía UTC (≈ 12:00 hora Chile continental) y se detiene la
+  // animación para que no vuelva a avanzar ni a oscurecerse con el tiempo.
+  const dayTime = Cesium.JulianDate.fromDate(
+    new Date(Date.UTC(
+      new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate(),
+      16, 0, 0 // 16:00 UTC ≈ 12:00 en Santiago (UTC-4) — sol alto, buena luz de día
+    ))
+  );
+  viewer.clock.currentTime = dayTime;
+  viewer.clock.shouldAnimate = false;
+  viewer.scene.light = new Cesium.SunLight();
 
   try {
     setLoadingStep("stepTiles", "active", "Descargando 3D Tiles fotorrealistas…");
@@ -981,7 +1002,7 @@ const CAR = {
   maxSpeed: 130,        // km/h
   minSpeed: -30,         // km/h (reversa)
   baseTurnRate: 120,      // °/s a máxima deflexión de dirección
-  steeringSensitivity: 1.0,
+  get steeringSensitivity(){ return gdSettings.steeringSensitivity; },
 };
 
 // Estado en vivo del auto (posición en grados, heading en grados, km/h).
@@ -996,7 +1017,11 @@ let carAnimFrameId = null;
 let carLastFrameTime = null;
 let camSmoothHeadingRad = null; // heading suavizado de la cámara (lag en curvas)
 const CAMERA_BACK_METERS = 9;   // distancia detrás del auto (no tiene lag: nunca se queda atrás)
-const CAMERA_UP_METERS = 3.8;
+// CAMERA_UP_METERS ahora vive en gdSettings.cameraHeight (ajustable desde
+// Configuración) en vez de ser una constante — una cámara más alta evita
+// que quede al ras de las mallas fotorrealistas cercanas (la "perspectiva
+// doblada" que se ve cuando la cámara casi toca un vehículo/objeto vecino).
+function getCameraUpMeters(){ return gdSettings.cameraHeight; }
 const CAMERA_FOLLOW_DELAY = 1.0; // 1.0 = feel original de GeoDrive; >1 más lag, <1 más ágil
 
 function bindDriveKey(key, prop){
@@ -1081,7 +1106,7 @@ function updateCarEntityAndCamera(dt){
   const vehicleTransform = Cesium.Transforms.headingPitchRollToFixedFrame(
     carPosition, new Cesium.HeadingPitchRoll(camSmoothHeadingRad, 0, 0)
   );
-  const camOffset = new Cesium.Cartesian3(0, -CAMERA_BACK_METERS, CAMERA_UP_METERS);
+  const camOffset = new Cesium.Cartesian3(0, -CAMERA_BACK_METERS, getCameraUpMeters());
   const camPos = Cesium.Matrix4.multiplyByPoint(vehicleTransform, camOffset, new Cesium.Cartesian3());
 
   // Apunta directo hacia el auto desde la posición de cámara calculada
@@ -1371,6 +1396,10 @@ const resolutionScaleSlider = document.getElementById("resolutionScaleSlider");
 const resolutionScaleValue = document.getElementById("resolutionScaleValue");
 const roadTileMarginSlider = document.getElementById("roadTileMarginSlider");
 const roadTileMarginValue = document.getElementById("roadTileMarginValue");
+const steeringSensitivitySlider = document.getElementById("steeringSensitivitySlider");
+const steeringSensitivityValue = document.getElementById("steeringSensitivityValue");
+const cameraHeightSlider = document.getElementById("cameraHeightSlider");
+const cameraHeightValue = document.getElementById("cameraHeightValue");
 const lowestSettingsBtn = document.getElementById("lowestSettingsBtn");
 
 function openSettings(){
@@ -1466,6 +1495,28 @@ roadTileMarginSlider.addEventListener("input", () => {
 });
 
 /**
+ * Sensibilidad de giro — multiplica CAR.baseTurnRate. Bajarla da un
+ * manejo más suave/progresivo a alta velocidad; subirla, un giro más
+ * cerrado e inmediato.
+ */
+steeringSensitivitySlider.addEventListener("input", () => {
+  gdSettings.steeringSensitivity = Number(steeringSensitivitySlider.value);
+  steeringSensitivityValue.textContent = `${Number(steeringSensitivitySlider.value).toFixed(2)}×`;
+});
+
+/**
+ * Altura de cámara — metros de la cámara en tercera persona sobre el
+ * auto. Subirla aleja la vista del ras de piso, evitando que la cámara
+ * quede casi encajada dentro de mallas fotorrealistas cercanas (veredas,
+ * vehículos estacionados, postes), que de muy cerca se ven distorsionadas
+ * ("dobladas") por artefactos propios de la fotogrametría de los 3D Tiles.
+ */
+cameraHeightSlider.addEventListener("input", () => {
+  gdSettings.cameraHeight = Number(cameraHeightSlider.value);
+  cameraHeightValue.textContent = `${Number(cameraHeightSlider.value).toFixed(1)} m`;
+});
+
+/**
  * Botón "Rendimiento máximo" — lleva todos los sliders/toggles a los
  * valores más livianos disponibles de una sola vez, para cuando el equipo
  * del usuario sigue sufriendo incluso con los valores por defecto.
@@ -1525,6 +1576,9 @@ let navMapDestMarker = null;
 let navMapCurrentZoom = 15;
 let navDestLatLng = null; // {lat, lng, label} o null si no hay destino
 let _navMapLastTick = 0;
+let navRouteLine = null;   // L.polyline con la ruta calculada (OSRM) al destino
+let navRouteCoords = null; // [[lat,lng], ...] de la ruta activa, o null
+let _navRouteFetchToken = 0; // evita pisar una ruta más nueva con una respuesta vieja
 
 function initNavMap(){
   const container = document.getElementById("navMinimap");
@@ -1579,11 +1633,37 @@ function updateNavMap(){
     } else {
       navMapDestMarker.setLatLng([navDestLatLng.lat, navDestLatLng.lng]);
     }
+
+    // Ruta visible: la geometría real de OSRM si ya llegó, o mientras
+    // tanto (o si OSRM no está disponible) una línea recta auto→destino,
+    // para que la navegación SIEMPRE muestre un trazo, no solo el punto.
+    const routeLatLngs = navRouteCoords && navRouteCoords.length > 1
+      ? navRouteCoords
+      : [[carState.lat, carState.lng], [navDestLatLng.lat, navDestLatLng.lng]];
+    if (!navRouteLine){
+      navRouteLine = L.polyline(routeLatLngs, {
+        color: "#E8B93A",
+        weight: 4,
+        opacity: 0.85,
+        dashArray: navRouteCoords ? null : "2,6", // punteada = todavía es solo la línea recta de respaldo
+      }).addTo(navMap);
+    } else {
+      navRouteLine.setLatLngs(routeLatLngs);
+      navRouteLine.setStyle({ dashArray: navRouteCoords ? null : "2,6" });
+    }
+
     const d = greatCircleDistanceKm(carState.lat, carState.lng, navDestLatLng.lat, navDestLatLng.lng);
     if (distEl) distEl.textContent = d < 1 ? `${Math.round(d * 1000)} m` : `${d.toFixed(1)} km`;
-  } else if (navMapDestMarker){
-    navMap.removeLayer(navMapDestMarker);
-    navMapDestMarker = null;
+  } else {
+    if (navMapDestMarker){
+      navMap.removeLayer(navMapDestMarker);
+      navMapDestMarker = null;
+    }
+    if (navRouteLine){
+      navMap.removeLayer(navRouteLine);
+      navRouteLine = null;
+    }
+    navRouteCoords = null;
     if (distEl) distEl.textContent = "—";
   }
 }
@@ -1597,10 +1677,54 @@ function greatCircleDistanceKm(lat1, lon1, lat2, lon2){
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+let _navRouteRefreshTimerId = null;
+
 function setNavDestination(lat, lng, label){
   navDestLatLng = { lat, lng, label: label || null };
   const destLabelEl = document.getElementById("navMinimapDestLabel");
   if (destLabelEl) destLabelEl.textContent = "📍 " + (label || `${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+  fetchNavRoute();
+  // Recalcula la ruta cada 15s mientras haya destino activo, así el trazo
+  // sigue reflejando la posición actual del auto (no queda "pegado" al
+  // punto de partida original a medida que se avanza).
+  if (_navRouteRefreshTimerId === null){
+    _navRouteRefreshTimerId = setInterval(() => {
+      if (navDestLatLng) fetchNavRoute();
+      else {
+        clearInterval(_navRouteRefreshTimerId);
+        _navRouteRefreshTimerId = null;
+      }
+    }, 15000);
+  }
+}
+
+/**
+ * fetchNavRoute — pide a OSRM (servidor demo público, sin API key) la
+ * geometría de la ruta en auto desde la posición actual hasta el destino
+ * fijado, y la deja lista en navRouteCoords para que updateNavMap() la
+ * dibuje/actualice como polyline dorada sobre el minimapa. Se reintenta
+ * cada vez que cambia el destino; si falla (sin conexión a OSRM) se cae
+ * de nuevo a la línea recta que ya dibuja updateNavMap como respaldo.
+ */
+async function fetchNavRoute(){
+  if (!navDestLatLng) { navRouteCoords = null; return; }
+  const token = ++_navRouteFetchToken;
+  const { lat: destLat, lng: destLng } = navDestLatLng;
+  const url = `https://router.project-osrm.org/route/v1/driving/`
+    + `${carState.lng},${carState.lat};${destLng},${destLat}?overview=full&geometries=geojson`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (token !== _navRouteFetchToken) return; // llegó una respuesta vieja, se descarta
+    const coords = data && data.routes && data.routes[0] && data.routes[0].geometry
+      ? data.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon])
+      : null;
+    navRouteCoords = coords;
+  } catch (e) {
+    if (token !== _navRouteFetchToken) return;
+    console.warn("Ruta OSRM falló (sin conexión), se muestra línea recta al destino:", e);
+    navRouteCoords = null;
+  }
 }
 
 async function searchNavLocation(){
