@@ -1204,7 +1204,18 @@ function updateCarPhysics(dt){
 function updateCarEntityAndCamera(dt){
   if (!audiEntity || !viewer) return;
 
-  const groundHeight = _lastCarGroundHeight ?? 0;
+  // No se aplica _lastCarGroundHeight (el target validado) directo: se
+  // desliza _displayedGroundHeight hacia él con suavizado exponencial, así
+  // incluso un cambio real y grande (p.ej. terreno confirmado tras un
+  // pico) se ve como una transición fluida y no como un salto brusco.
+  const targetGroundHeight = _lastCarGroundHeight ?? 0;
+  if (_displayedGroundHeight === null){
+    _displayedGroundHeight = targetGroundHeight;
+  } else {
+    const heightAlpha = 1.0 - Math.exp(-GROUND_HEIGHT_SMOOTH_RATE * dt);
+    _displayedGroundHeight += (targetGroundHeight - _displayedGroundHeight) * heightAlpha;
+  }
+  const groundHeight = _displayedGroundHeight;
   const carPosition = Cesium.Cartesian3.fromDegrees(carState.lng, carState.lat, groundHeight);
   const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(carState.heading + MODEL_HEADING_OFFSET_DEG), 0, 0);
   audiEntity.position = carPosition;
@@ -1291,14 +1302,37 @@ function updateCarEntityAndCamera(dt){
   }
 }
 
-let _lastCarGroundHeight = null;
+let _lastCarGroundHeight = null;   // última altura de terreno VALIDADA (target)
+let _pendingSpikeHeight = null;    // lectura atípica en espera de confirmación
+let _displayedGroundHeight = null; // altura realmente aplicada al auto (suavizada frame a frame)
 let _carGroundSampleInFlight = false;
+
+// Umbral de salto máximo verosímil entre dos muestreos consecutivos de
+// altura (cada CAR_GROUND_SAMPLE_INTERVAL_MS). Los 3D Tiles a veces
+// devuelven lecturas erráticas (p.ej. un pico de cientos de metros por un
+// glitch de LOD/raycast) que no corresponden a ningún cambio real de
+// terreno. 500→501→850→503 es exactamente ese caso: 850 se descarta.
+// 20m en 400ms equivale a ~50m/s de velocidad vertical, muy por encima de
+// cualquier rampa o pendiente real — suficiente margen para no rechazar
+// subidas/bajadas legítimas (500→502→505→510) pero sí un salto absurdo.
+const CAR_GROUND_SAMPLE_INTERVAL_MS = 400;
+const MAX_PLAUSIBLE_GROUND_JUMP_M = 20;
+// Velocidad (en "unidades de suavizado exponencial") a la que el auto se
+// desliza hacia la altura validada, en vez de teletransportarse a ella.
+const GROUND_HEIGHT_SMOOTH_RATE = 6;
 
 /**
  * sampleCarGroundHeight — re-muestrea la altura real del terreno bajo el
  * auto de forma periódica (no cada frame, es una llamada relativamente
  * cara) para que el auto se mantenga apoyado en el suelo/rampas mientras
  * se conduce, igual que hace GeoDrive con su plano de referencia.
+ *
+ * No se confía ciegamente en cada lectura: se compara contra la última
+ * altura válida y, si el salto es implausible, se descarta como posible
+ * error de los 3D Tiles (ver MAX_PLAUSIBLE_GROUND_JUMP_M). Si la misma
+ * lectura atípica se repite en el ciclo siguiente, se asume que es un
+ * cambio real de terreno (p.ej. el auto subió a un puente/rampa abrupta)
+ * y se acepta, para no quedar "trabado" si el pico no era un error.
  */
 async function sampleCarGroundHeight(){
   if (_carGroundSampleInFlight || !viewer) return;
@@ -1313,7 +1347,31 @@ async function sampleCarGroundHeight(){
     const excluded = audiEntity ? [audiEntity] : [];
     const sampled = await sampleHeightMostDetailedSafe(carto ? [carto] : [], undefined, excluded);
     if (sampled && sampled[0] && isFinite(sampled[0].height)){
-      _lastCarGroundHeight = sampled[0].height;
+      const newHeight = sampled[0].height;
+      if (_lastCarGroundHeight === null){
+        // Primera lectura: no hay referencia previa contra la cual validar.
+        _lastCarGroundHeight = newHeight;
+        _pendingSpikeHeight = null;
+      } else {
+        const jump = Math.abs(newHeight - _lastCarGroundHeight);
+        if (jump <= MAX_PLAUSIBLE_GROUND_JUMP_M){
+          // Cambio dentro de lo esperable (incluye subidas/bajadas reales).
+          _lastCarGroundHeight = newHeight;
+          _pendingSpikeHeight = null;
+        } else if (_pendingSpikeHeight !== null &&
+                   Math.abs(newHeight - _pendingSpikeHeight) <= MAX_PLAUSIBLE_GROUND_JUMP_M){
+          // La lectura atípica se repitió: se confirma como cambio real.
+          _lastCarGroundHeight = newHeight;
+          _pendingSpikeHeight = null;
+        } else {
+          // Pico aislado: se descarta y se conserva la última altura válida.
+          console.warn(
+            `Lectura de altura del terreno descartada (salto de ${jump.toFixed(1)}m): ` +
+            `${newHeight.toFixed(1)}m vs última válida ${_lastCarGroundHeight.toFixed(1)}m.`
+          );
+          _pendingSpikeHeight = newHeight;
+        }
+      }
     }
   } catch (e) { /* sin conexión momentánea, se reintenta en el próximo ciclo */ }
   _carGroundSampleInFlight = false;
@@ -1338,7 +1396,7 @@ function startCarLoop(){
   carLastFrameTime = null;
   carAnimFrameId = requestAnimationFrame(carAnimationLoop);
   if (_carGroundSampleTimerId === null){
-    _carGroundSampleTimerId = setInterval(sampleCarGroundHeight, 400);
+    _carGroundSampleTimerId = setInterval(sampleCarGroundHeight, CAR_GROUND_SAMPLE_INTERVAL_MS);
   }
 }
 let _carGroundSampleTimerId = null;
@@ -1376,6 +1434,8 @@ async function spawnAudiQuattro(){
     console.warn("No se pudo muestrear la altura del terreno en el spawn, usando 0.");
   }
   _lastCarGroundHeight = groundHeight;
+  _pendingSpikeHeight = null;
+  _displayedGroundHeight = groundHeight; // sin suavizado en el spawn: aparece directo en su altura
 
   carState.lat = SPAWN_LAT;
   carState.lng = SPAWN_LON;

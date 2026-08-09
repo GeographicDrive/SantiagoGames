@@ -374,10 +374,13 @@ body{
 
 .settings-panel{
   width:min(360px, 90vw);
+  max-height:min(560px, 85vh);
   background:var(--card-bg);
   border:1px solid var(--line);
   border-radius:var(--radius);
   overflow:hidden;
+  display:flex;
+  flex-direction:column;
   animation:settings-scale 0.2s cubic-bezier(.22,.61,.36,1) both;
 }
 
@@ -397,6 +400,7 @@ body{
   text-transform:uppercase;
   font-weight:700;
   color:var(--line);
+  flex-shrink:0;
 }
 
 .settings-panel__close{
@@ -420,6 +424,19 @@ body{
   display:flex;
   flex-direction:column;
   gap:20px;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+}
+
+.settings-panel__body::-webkit-scrollbar{
+  width:6px;
+}
+.settings-panel__body::-webkit-scrollbar-track{
+  background:transparent;
+}
+.settings-panel__body::-webkit-scrollbar-thumb{
+  background:var(--line);
+  border-radius:3px;
 }
 
 .settings-row.is-disabled{
