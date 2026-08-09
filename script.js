@@ -353,6 +353,9 @@ const gdSettings = {
   freeLookReturnDelay: 1.2, // Segundos sin arrastrar antes de que la cámara vuelva sola al
                              // centro (GeoDrive: Settings → Camera → "Free-Look Reset Delay").
                              // Poner Infinity desde el slider ("Never") desactiva el retorno.
+  streetRepulsion: 0.5,     // Slider "Repulsión de calles" (0..1 = 0%-100%). 0 = el auto puede
+                             // salirse completamente de las calles; 1 = prácticamente no puede
+                             // abandonar la superficie vial. Ver updateStreetRepulsion().
 };
 
 /* ===================== FREE-LOOK / ORBIT CAMERA (portado de GeoDrive) =====
@@ -1104,6 +1107,135 @@ async function generateInitialRoadPatch(spawnLon, spawnLat){
   }
 }
 
+/* ===================== REPULSIÓN DE CALLES (barrera invisible) ==========
+ * Mantiene al auto sobre la superficie vial sin reemplazar ni tocar el
+ * sistema de obtención/generación de calles: se apoya 100% en los datos
+ * que YA arma ese sistema (roadTiles, con roads[].coordinates + heights,
+ * y ROAD_WIDTH_BY_TYPE para el ancho real de cada vía).
+ *
+ * Rendimiento: NO se recorre "todas las calles del mapa" en cada frame.
+ * `roadTiles` ya es, por diseño del streaming (updateRoadStreaming), el
+ * conjunto acotado de tiles cercanos al auto (grilla 3×3 o la que defina
+ * ROAD_TILE_LOAD_MARGIN_TILES) — se reutiliza tal cual como "spatial
+ * index" existente, sin crear una grilla nueva en paralelo. Dentro de esos
+ * pocos tiles, cada segmento se descarta primero con una caja delimitadora
+ * barata (STREET_REPULSION_SEARCH_RADIUS_METERS) antes de calcular la
+ * distancia punto-segmento real, y las coordenadas lon/lat de cada vía se
+ * proyectan a XY local UNA sola vez (cacheadas en road._xy), no en cada
+ * frame.
+ */
+const STREET_REPULSION_SEARCH_RADIUS_METERS = 40; // cubre cualquier ancho de vía + margen amplio
+const STREET_REPULSION_MAX_PUSH_MPS = 22; // velocidad máxima de empuje (100% de intensidad, ya fuera de tolerancia)
+
+/** _roadLocalXY — proyección XY local de una vía, cacheada en el propio
+ * objeto `road` (persiste en memoria igual que road.heights, sobrevive a
+ * la descarga visual del tile — ver comentario de unloadRoadTile). */
+function _roadLocalXY(road){
+  if (!road._xy) {
+    road._xy = road.coordinates.map((c) => lonLatToLocalXY(c.lon, c.lat));
+  }
+  return road._xy;
+}
+
+/** _closestPointOnSegment — proyección del punto (px,py) sobre el
+ * segmento a→b, clampeada a los extremos. Base de toda la búsqueda: el
+ * punto de repulsión SIEMPRE es el punto más cercano real de la calzada,
+ * nunca el nodo de ruta más próximo ni el centro del mapa. */
+function _closestPointOnSegment(px, py, ax, ay, bx, by){
+  const abx = bx - ax, aby = by - ay;
+  const lenSq = abx * abx + aby * aby;
+  let t = lenSq > 1e-9 ? ((px - ax) * abx + (py - ay) * aby) / lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  const x = ax + abx * t, y = ay + aby * t;
+  const dx = px - x, dy = py - y;
+  return { x, y, distSq: dx * dx + dy * dy };
+}
+
+/**
+ * findNearestRoadSurface — entre las calles YA cargadas alrededor del
+ * auto (roadTiles), busca el punto de calzada más cercano a (px, py) en
+ * XY local. Devuelve la distancia al CENTRO de esa vía, el punto más
+ * cercano y su semiancho real (ROAD_WIDTH_BY_TYPE), o null si no hay
+ * ninguna vía cargada cerca.
+ */
+function findNearestRoadSurface(px, py){
+  const R = STREET_REPULSION_SEARCH_RADIUS_METERS;
+  let best = null;
+  let bestDistSq = Infinity;
+
+  for (const tile of roadTiles.values()){
+    if (!tile.roads || tile.roads.length === 0) continue;
+    for (const road of tile.roads){
+      const xy = _roadLocalXY(road);
+      if (xy.length < 2) continue;
+      const halfWidth = (ROAD_WIDTH_BY_TYPE[road.highwayType] ?? ROAD_WIDTH_DEFAULT) / 2;
+
+      for (let i = 0; i < xy.length - 1; i++){
+        const a = xy[i], b = xy[i + 1];
+        // Descarte rápido por caja delimitadora antes de la distancia real.
+        if (Math.min(a.x, b.x) - px > R || px - Math.max(a.x, b.x) > R) continue;
+        if (Math.min(a.y, b.y) - py > R || py - Math.max(a.y, b.y) > R) continue;
+
+        const c = _closestPointOnSegment(px, py, a.x, a.y, b.x, b.y);
+        if (c.distSq < bestDistSq){
+          bestDistSq = c.distSq;
+          best = { x: c.x, y: c.y, distance: Math.sqrt(c.distSq), halfWidth };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * updateStreetRepulsion — "campo de repulsión" que mantiene al auto sobre
+ * la superficie vial. Se llama una vez por frame, DESPUÉS de
+ * updateCarPhysics (que ya movió carState según input/heading) y ANTES de
+ * updateCarEntityAndCamera (que renderiza esa posición), así el empuje
+ * queda integrado en la misma posición que se dibuja ese frame — nunca es
+ * un teletransporte, es un desplazamiento adicional acotado por dt.
+ *
+ * gdSettings.streetRepulsion (0..1 = slider "Repulsión de calles" 0%-100%):
+ *   0%   → esta función retorna de inmediato sin tocar carState: el auto
+ *          puede salir completamente de las calles.
+ *   50%  → tolerancia moderada: se puede desviar parcialmente antes de
+ *          sentir un empuje fuerte.
+ *   100% → tolerancia ~1% del semiancho de la vía: apenas se sale, el
+ *          empuje satura casi de inmediato a su máximo.
+ */
+function updateStreetRepulsion(dt){
+  const intensity = gdSettings.streetRepulsion;
+  if (!intensity || intensity <= 0) return;
+
+  const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
+  const surface = findNearestRoadSurface(carX, carY);
+  if (!surface) return; // nada cargado cerca todavía (p.ej. justo al spawnear)
+
+  const excess = surface.distance - surface.halfWidth; // metros fuera del borde de calzada
+  if (excess <= 0) return; // ya está dentro del ancho real de la calle: sin repulsión
+
+  // Tolerancia antes del empuje máximo: ~1% del semiancho al 100% (según
+  // spec), creciendo a medida que baja la intensidad — con menos %, más
+  // margen para desviarse antes de sentir el empuje con fuerza.
+  const toleranceMeters = Math.max(0.03, surface.halfWidth * (0.01 + (1 - intensity) * 1.5));
+  const strength = Math.pow(Math.min(1, excess / toleranceMeters), 1.3); // progresivo, no escalón
+  const pushSpeed = STREET_REPULSION_MAX_PUSH_MPS * intensity * strength; // m/s
+
+  // Dirección real hacia el punto de calzada más cercano (no al centro del
+  // mapa ni al nodo de ruta más próximo). El desplazamiento de este frame
+  // nunca pasa de largo ese punto (evita overshoot/oscilación con dt alto).
+  const invDist = 1 / Math.max(surface.distance, 1e-6);
+  const dirX = (surface.x - carX) * invDist;
+  const dirY = (surface.y - carY) * invDist;
+  const moveDist = Math.min(pushSpeed * dt, excess);
+
+  const newX = carX + dirX * moveDist;
+  const newY = carY + dirY * moveDist;
+  const { lon, lat } = localXYToLonLat(newX, newY);
+  carState.lng = lon;
+  carState.lat = lat;
+}
+
 /**
 /* ===================== SISTEMA DE CONDUCCIÓN (portado de GeoDrive) =====
    Física simplificada de vehículo terrestre — misma fórmula que usa
@@ -1415,6 +1547,7 @@ function carAnimationLoop(timestampMs){
 
   const _tPhysicsStart = Profiler.enabled ? performance.now() : 0;
   updateCarPhysics(dt);
+  updateStreetRepulsion(dt);
   updateFreeLookIdle(dt);
   const _tCamStart = Profiler.enabled ? performance.now() : 0;
   updateCarEntityAndCamera(dt);
@@ -1694,6 +1827,8 @@ const cameraLookBlendSlider = document.getElementById("cameraLookBlendSlider");
 const cameraLookBlendValue = document.getElementById("cameraLookBlendValue");
 const freeLookReturnDelaySlider = document.getElementById("freeLookReturnDelaySlider");
 const freeLookReturnDelayValue = document.getElementById("freeLookReturnDelayValue");
+const streetRepulsionSlider = document.getElementById("streetRepulsionSlider");
+const streetRepulsionValue = document.getElementById("streetRepulsionValue");
 const lowestSettingsBtn = document.getElementById("lowestSettingsBtn");
 
 function openSettings(){
@@ -1864,6 +1999,17 @@ freeLookReturnDelaySlider.addEventListener("input", () => {
     gdSettings.freeLookReturnDelay = n;
     freeLookReturnDelayValue.textContent = `${n.toFixed(1)} s`;
   }
+});
+
+/**
+ * Repulsión de calles — gdSettings.streetRepulsion (0..1). Slider en %
+ * (0-100) en el HTML; se guarda como fracción para usarlo directo en
+ * updateStreetRepulsion(). En tiempo real: el próximo frame ya aplica el
+ * nuevo valor, no hace falta reiniciar nada.
+ */
+streetRepulsionSlider.addEventListener("input", () => {
+  gdSettings.streetRepulsion = Number(streetRepulsionSlider.value) / 100;
+  streetRepulsionValue.textContent = `${streetRepulsionSlider.value}%`;
 });
 
 /**
