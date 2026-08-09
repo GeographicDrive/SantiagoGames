@@ -282,6 +282,19 @@ body{
   letter-spacing:0.03em;
 }
 
+.hud__line--repulsion-debug{
+  margin-top:6px;
+  font-weight:700;
+  letter-spacing:0.08em;
+  text-transform:uppercase;
+}
+.hud__line--repulsion-debug.is-off-street{
+  color:#ff4d4d;
+}
+.hud__line--repulsion-debug.is-on-street{
+  color:#5fd66b;
+}
+
 .back-link{
   position:fixed;
   top:20px;

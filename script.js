@@ -356,6 +356,9 @@ const gdSettings = {
   streetRepulsion: 0.5,     // Slider "Repulsión de calles" (0..1 = 0%-100%). 0 = el auto puede
                              // salirse completamente de las calles; 1 = prácticamente no puede
                              // abandonar la superficie vial. Ver updateStreetRepulsion().
+  repulsionDebug: false,    // Toggle "Repulsión debug" en Configuración: pinta en rojo en el
+                             // minimapa las zonas que NO son calle y muestra en el HUD el
+                             // estado actual (NOT STREET/STREET, REPULSION/NOT REPULSION).
 };
 
 /* ===================== FREE-LOOK / ORBIT CAMERA (portado de GeoDrive) =====
@@ -1242,7 +1245,13 @@ const STREET_AUTOPILOT_MIN_TRACTION_KMH = 18;
  */
 function updateStreetRepulsion(dt){
   const intensity = gdSettings.streetRepulsion;
-  if (!intensity || intensity <= 0) return;
+
+  // Modo debug: aunque la intensidad esté en 0%, si el toggle "Repulsión
+  // debug" está activo igual queremos saber/mostrar si el auto está o no
+  // sobre la calle (para eso está la línea del HUD y el overlay rojo del
+  // minimapa). Por eso la búsqueda de superficie se hace también cuando
+  // intensity es 0, en vez de retornar de inmediato como antes.
+  if ((!intensity || intensity <= 0) && !gdSettings.repulsionDebug) return;
 
   const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
 
@@ -1250,10 +1259,18 @@ function updateStreetRepulsion(dt){
   // como fallback si el auto quedó muy lejos de cualquier vía cargada.
   let surface = findNearestRoadSurface(carX, carY, STREET_REPULSION_SEARCH_RADIUS_METERS);
   if (!surface) surface = findNearestRoadSurface(carX, carY, Infinity);
-  if (!surface) return; // no hay ninguna calle cargada todavía (p.ej. justo al spawnear)
+  if (!surface){
+    updateRepulsionDebugState(null); // sin dato todavía (p.ej. justo al spawnear)
+    return;
+  }
 
   const excess = surface.distance - surface.halfWidth; // metros fuera del borde de calzada
-  if (excess <= 0) return; // ya está dentro del ancho real de la calle: autopilot no interviene
+  const onStreet = excess <= 0;
+  const repulsionWillAct = !onStreet && intensity > 0;
+  updateRepulsionDebugState(onStreet, repulsionWillAct);
+
+  if (!intensity || intensity <= 0) return; // debug-only: sin intensidad, no se corrige nada
+  if (onStreet) return; // ya está dentro del ancho real de la calle: autopilot no interviene
 
   // Tolerancia antes de corregir con fuerza: mismo criterio que antes,
   // ~1% del semiancho al 100%, creciendo a medida que baja la intensidad.
@@ -1303,6 +1320,41 @@ function updateStreetRepulsion(dt){
   const minTraction = STREET_AUTOPILOT_MIN_TRACTION_KMH * intensity * strength;
   if (Math.abs(carState.speed) < minTraction){
     carState.speed = minTraction;
+  }
+}
+
+/**
+ * updateRepulsionDebugState — actualiza la línea de texto del HUD
+ * ("-NOT STREET, REPULSION-" / "-STREET, NOT REPULSION-") cuando el toggle
+ * "Repulsión debug" de Configuración está activo. No hace nada (ni toca el
+ * DOM) si el debug está apagado, para no gastar trabajo en el caso normal.
+ *
+ * onStreet: true = el auto está dentro del ancho real de la calzada.
+ *           false = está fuera.
+ *           null  = todavía no hay ninguna vía cargada cerca (sin dato).
+ * repulsionActive: true si, dado el estado actual, el autopilot de calles
+ *           está efectivamente corrigiendo el heading este frame (solo
+ *           puede ser true si onStreet es false y la intensidad > 0%).
+ */
+function updateRepulsionDebugState(onStreet, repulsionActive){
+  if (!gdSettings.repulsionDebug) return;
+  const el = document.getElementById("repulsionDebugLine");
+  if (!el) return;
+
+  el.classList.remove("is-off-street", "is-on-street");
+  if (onStreet === null){
+    el.textContent = "-SIN DATOS DE CALLE-";
+    return;
+  }
+  if (onStreet){
+    el.textContent = "-STREET, NOT REPULSION-";
+    el.classList.add("is-on-street");
+  } else if (repulsionActive){
+    el.textContent = "-NOT STREET, REPULSION-";
+    el.classList.add("is-off-street");
+  } else {
+    el.textContent = "-NOT STREET, NOT REPULSION-";
+    el.classList.add("is-off-street");
   }
 }
 
@@ -2083,6 +2135,21 @@ streetRepulsionSlider.addEventListener("input", () => {
 });
 
 /**
+ * Repulsión debug — gdSettings.repulsionDebug. Muestra/oculta la línea de
+ * estado del HUD (updateRepulsionDebugState) y el overlay rojo del
+ * minimapa (updateRepulsionDebugOverlay); al desactivarlo, la línea del
+ * HUD se oculta y el overlay se limpia en el próximo tick del minimapa.
+ */
+const repulsionDebugToggle = document.getElementById("repulsionDebugToggle");
+const repulsionDebugLine = document.getElementById("repulsionDebugLine");
+if (repulsionDebugToggle){
+  repulsionDebugToggle.addEventListener("change", () => {
+    gdSettings.repulsionDebug = repulsionDebugToggle.checked;
+    if (repulsionDebugLine) repulsionDebugLine.hidden = !gdSettings.repulsionDebug;
+  });
+}
+
+/**
  * Botón "Rendimiento máximo" — lleva todos los sliders/toggles a los
  * valores más livianos disponibles de una sola vez, para cuando el equipo
  * del usuario sigue sufriendo incluso con los valores por defecto.
@@ -2146,6 +2213,63 @@ let navRouteLine = null;   // L.polyline con la ruta calculada (OSRM) al destino
 let navRouteCoords = null; // [[lat,lng], ...] de la ruta activa, o null
 let _navRouteFetchToken = 0; // evita pisar una ruta más nueva con una respuesta vieja
 
+/* ---- Overlay rojo de debug de repulsión (celdas "NOT STREET" en el minimapa) ---- */
+let repulsionDebugLayer = null;   // L.layerGroup con los rectángulos rojos, creado on-demand
+let _repulsionDebugLastTick = 0;
+const REPULSION_DEBUG_UPDATE_INTERVAL_MS = 300; // más lento que el minimapa: es solo debug visual
+const REPULSION_DEBUG_GRID_SPACING_M = 5;   // separación entre celdas de muestreo
+const REPULSION_DEBUG_GRID_RADIUS_M = 55;   // radio de muestreo alrededor del auto
+
+/** updateRepulsionDebugOverlay — mientras gdSettings.repulsionDebug está
+ * activo, muestrea una grilla de puntos alrededor del auto y pinta en rojo,
+ * directamente sobre el minimapa Leaflet, cada celda que NO está dentro del
+ * ancho real de ninguna calle cargada. Usa las mismas findNearestRoadSurface
+ * / lonLatToLocalXY / localXYToLonLat que updateStreetRepulsion, así el
+ * overlay siempre coincide exactamente con lo que "siente" el autopilot. */
+function updateRepulsionDebugOverlay(){
+  if (!navMap) return;
+
+  if (!gdSettings.repulsionDebug){
+    if (repulsionDebugLayer){
+      navMap.removeLayer(repulsionDebugLayer);
+      repulsionDebugLayer = null;
+    }
+    return;
+  }
+
+  const now = performance.now();
+  if (now - _repulsionDebugLastTick < REPULSION_DEBUG_UPDATE_INTERVAL_MS) return;
+  _repulsionDebugLastTick = now;
+
+  if (!repulsionDebugLayer){
+    repulsionDebugLayer = L.layerGroup().addTo(navMap);
+  }
+  repulsionDebugLayer.clearLayers();
+
+  const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
+  const step = REPULSION_DEBUG_GRID_SPACING_M;
+  const R = REPULSION_DEBUG_GRID_RADIUS_M;
+
+  for (let gx = -R; gx <= R; gx += step){
+    for (let gy = -R; gy <= R; gy += step){
+      const px = carX + gx, py = carY + gy;
+      let surface = findNearestRoadSurface(px, py, STREET_REPULSION_SEARCH_RADIUS_METERS);
+      if (!surface) surface = findNearestRoadSurface(px, py, Infinity);
+      const offStreet = !surface || (surface.distance - surface.halfWidth) > 0;
+      if (!offStreet) continue; // solo se pinta lo que NO es calle
+
+      const { lon, lat } = localXYToLonLat(px, py);
+      L.circleMarker([lat, lon], {
+        radius: 3,
+        stroke: false,
+        fillColor: "#ff2b2b",
+        fillOpacity: 0.55,
+        interactive: false,
+      }).addTo(repulsionDebugLayer);
+    }
+  }
+}
+
 function initNavMap(){
   const container = document.getElementById("navMinimap");
   if (!container || typeof L === "undefined") return;
@@ -2185,6 +2309,8 @@ function updateNavMap(){
   // queda fija apuntando siempre hacia arriba del overlay.
   const el = document.getElementById("navMinimap");
   if (el) el.style.transform = `rotate(${-carState.heading}deg)`;
+
+  updateRepulsionDebugOverlay();
 
   const distEl = document.getElementById("navMinimapDistWrap");
   if (navDestLatLng){

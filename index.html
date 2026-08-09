@@ -98,6 +98,7 @@
       <div class="hud__title" id="hudTitle">SANTIAGOGAMES</div>
       <div class="hud__line">Spawn: 1988 Audi Quattro · -33.4721851, -70.7039520 · NNO (332.5°)</div>
       <div class="hud__line" id="hudStatus">Cargando 3D Tiles…</div>
+      <div class="hud__line hud__line--repulsion-debug" id="repulsionDebugLine" hidden></div>
     </div>
 
     <div class="top-right-controls">
@@ -185,6 +186,14 @@
               <span class="settings-row__value" id="streetRepulsionValue">50%</span>
             </div>
             <input type="range" class="gd-slider" id="streetRepulsionSlider" min="0" max="100" step="1" value="50">
+          </div>
+
+          <div class="settings-row settings-row--switch">
+            <span>Repulsión debug</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="repulsionDebugToggle">
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
           </div>
 
           <div class="settings-row">
