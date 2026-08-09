@@ -1107,11 +1107,17 @@ async function generateInitialRoadPatch(spawnLon, spawnLat){
   }
 }
 
-/* ===================== REPULSIÓN DE CALLES (barrera invisible) ==========
+/* ===================== AUTOPILOT DE CALLES (tipo Tesla) ==================
  * Mantiene al auto sobre la superficie vial sin reemplazar ni tocar el
  * sistema de obtención/generación de calles: se apoya 100% en los datos
  * que YA arma ese sistema (roadTiles, con roads[].coordinates + heights,
  * y ROAD_WIDTH_BY_TYPE para el ancho real de cada vía).
+ *
+ * A diferencia de un campo de repulsión que empuja la posición del auto
+ * directamente, este sistema actúa como el autopilot de un Tesla: corrige
+ * carState.heading (girando el "volante" virtual) para que el auto, con su
+ * propia física de conducción, se re-dirija solo hacia el carril. Ver
+ * updateStreetRepulsion más abajo para el detalle de la corrección.
  *
  * Rendimiento: NO se recorre "todas las calles del mapa" en cada frame.
  * `roadTiles` ya es, por diseño del streaming (updateRoadStreaming), el
@@ -1182,7 +1188,18 @@ function findNearestRoadSurface(px, py, maxRadius){
         const c = _closestPointOnSegment(px, py, a.x, a.y, b.x, b.y);
         if (c.distSq < bestDistSq){
           bestDistSq = c.distSq;
-          best = { x: c.x, y: c.y, distance: Math.sqrt(c.distSq), halfWidth };
+          // Dirección del segmento (tangente de la vía en ese punto), normalizada.
+          // Es la referencia de "hacia dónde apunta el carril" que usa el
+          // autopilot para alinear el heading del auto, no solo para tirar
+          // de su posición.
+          const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1e-6;
+          best = {
+            x: c.x, y: c.y,
+            distance: Math.sqrt(c.distSq),
+            halfWidth,
+            dirX: (b.x - a.x) / segLen,
+            dirY: (b.y - a.y) / segLen,
+          };
         }
       }
     }
@@ -1190,21 +1207,38 @@ function findNearestRoadSurface(px, py, maxRadius){
   return best;
 }
 
+// Velocidad angular máxima (°/s) con la que el autopilot puede corregir el
+// heading del auto al 100% de intensidad — análoga a STREET_REPULSION_MAX_PUSH_MPS
+// pero para giro en vez de empuje lateral directo.
+const STREET_AUTOPILOT_MAX_TURN_DEG_S = 160;
+// Velocidad mínima (km/h) que el autopilot impone cuando el auto está
+// descarrilado y casi detenido, para que "gire el volante" tenga efecto real
+// (si no avanza, corregir el heading no lo devuelve al carril).
+const STREET_AUTOPILOT_MIN_TRACTION_KMH = 18;
+
 /**
- * updateStreetRepulsion — "campo de repulsión" que mantiene al auto sobre
+ * updateStreetRepulsion — "autopilot de calle" que mantiene al auto sobre
  * la superficie vial. Se llama una vez por frame, DESPUÉS de
  * updateCarPhysics (que ya movió carState según input/heading) y ANTES de
- * updateCarEntityAndCamera (que renderiza esa posición), así el empuje
- * queda integrado en la misma posición que se dibuja ese frame — nunca es
- * un teletransporte, es un desplazamiento adicional acotado por dt.
+ * updateCarEntityAndCamera (que renderiza esa posición).
+ *
+ * A diferencia del campo de repulsión anterior (que empujaba carState.lat/lng
+ * directamente, como si una fuerza externa arrastrara el auto), esto imita
+ * un autopilot tipo Tesla: NUNCA toca la posición del auto directamente,
+ * solo corrige carState.heading (y da tracción mínima si el auto está casi
+ * detenido) para que sea el propio auto, con su física normal de
+ * updateCarPhysics, el que se redirija de vuelta al carril. El resultado se
+ * integra recién en el próximo frame vía updateCarPhysics, no en este.
  *
  * gdSettings.streetRepulsion (0..1 = slider "Repulsión de calles" 0%-100%):
  *   0%   → esta función retorna de inmediato sin tocar carState: el auto
- *          puede salir completamente de las calles.
- *   50%  → tolerancia moderada: se puede desviar parcialmente antes de
- *          sentir un empuje fuerte.
- *   100% → tolerancia ~1% del semiancho de la vía: apenas se sale, el
- *          empuje satura casi de inmediato a su máximo.
+ *          puede salir completamente de las calles y el heading es 100%
+ *          manual.
+ *   50%  → corrección moderada: el autopilot ayuda a re-alinear pero deja
+ *          margen de desvío antes de intervenir con fuerza.
+ *   100% → corrección casi inmediata: apenas el auto se sale de la
+ *          calzada, el autopilot gira el heading agresivamente hacia el
+ *          carril, como si "descarrilar" activara un autopilot Tesla.
  */
 function updateStreetRepulsion(dt){
   const intensity = gdSettings.streetRepulsion;
@@ -1212,40 +1246,64 @@ function updateStreetRepulsion(dt){
 
   const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
 
-  // Primero, la búsqueda barata (con descarte por caja a 40 m) — cubre el
-  // caso normal (auto cerca de la calle) sin costo extra. Si el auto ya
-  // se alejó más de eso (p. ej. quedó dentro de un edificio/patio lejos
-  // de la vía), se hace una segunda pasada SIN límite de radio: sigue
-  // acotada a los mismos tiles ya cargados (roadTiles), así que no
-  // recorre "todo el mapa" — solo evita el early-out que antes dejaba la
-  // repulsión sin efecto cuando el auto estaba demasiado lejos.
+  // Misma búsqueda de siempre: barata primero (40 m), sin límite de radio
+  // como fallback si el auto quedó muy lejos de cualquier vía cargada.
   let surface = findNearestRoadSurface(carX, carY, STREET_REPULSION_SEARCH_RADIUS_METERS);
   if (!surface) surface = findNearestRoadSurface(carX, carY, Infinity);
-  if (!surface) return; // no hay ninguna calle cargada en absoluto todavía (p.ej. justo al spawnear)
+  if (!surface) return; // no hay ninguna calle cargada todavía (p.ej. justo al spawnear)
 
   const excess = surface.distance - surface.halfWidth; // metros fuera del borde de calzada
-  if (excess <= 0) return; // ya está dentro del ancho real de la calle: sin repulsión
+  if (excess <= 0) return; // ya está dentro del ancho real de la calle: autopilot no interviene
 
-  // Tolerancia antes del empuje máximo: ~1% del semiancho al 100% (según
-  // spec), creciendo a medida que baja la intensidad — con menos %, más
-  // margen para desviarse antes de sentir el empuje con fuerza.
+  // Tolerancia antes de corregir con fuerza: mismo criterio que antes,
+  // ~1% del semiancho al 100%, creciendo a medida que baja la intensidad.
   const toleranceMeters = Math.max(0.03, surface.halfWidth * (0.01 + (1 - intensity) * 1.5));
   const strength = Math.pow(Math.min(1, excess / toleranceMeters), 1.3); // progresivo, no escalón
-  const pushSpeed = STREET_REPULSION_MAX_PUSH_MPS * intensity * strength; // m/s
 
-  // Dirección real hacia el punto de calzada más cercano (no al centro del
-  // mapa ni al nodo de ruta más próximo). El desplazamiento de este frame
-  // nunca pasa de largo ese punto (evita overshoot/oscilación con dt alto).
+  // Heading deseado: mezcla entre "apuntar hacia el punto de calzada más
+  // cercano" (corrige rápido cuando está muy desviado, como el volante
+  // virando fuerte) y "alinearse con la tangente de la vía" (una vez cerca
+  // del carril, endereza en vez de zigzaguear hacia el punto exacto —
+  // igual que el lane-centering de un autopilot real). Cuanto mayor
+  // 'strength' (más lejos del borde), más peso tiene "ir hacia el punto";
+  // cerca del borde, domina "seguir la dirección del carril".
   const invDist = 1 / Math.max(surface.distance, 1e-6);
-  const dirX = (surface.x - carX) * invDist;
-  const dirY = (surface.y - carY) * invDist;
-  const moveDist = Math.min(pushSpeed * dt, excess);
+  const toPointX = (surface.x - carX) * invDist;
+  const toPointY = (surface.y - carY) * invDist;
+  // La tangente puede apuntar en cualquiera de los dos sentidos de la vía;
+  // se elige el sentido más cercano al heading actual del auto para no
+  // forzar una vuelta en U innecesaria.
+  const curHdgRad = Cesium.Math.toRadians(carState.heading);
+  const curDirX = Math.sin(curHdgRad), curDirY = Math.cos(curHdgRad);
+  const tangentSign = (surface.dirX * curDirX + surface.dirY * curDirY) >= 0 ? 1 : -1;
+  const tanX = surface.dirX * tangentSign, tanY = surface.dirY * tangentSign;
 
-  const newX = carX + dirX * moveDist;
-  const newY = carY + dirY * moveDist;
-  const { lon, lat } = localXYToLonLat(newX, newY);
-  carState.lng = lon;
-  carState.lat = lat;
+  const blend = strength; // 0 = solo tangente, 1 = solo "hacia el punto"
+  let desiredX = toPointX * blend + tanX * (1 - blend);
+  let desiredY = toPointY * blend + tanY * (1 - blend);
+  const desiredLen = Math.hypot(desiredX, desiredY) || 1e-6;
+  desiredX /= desiredLen; desiredY /= desiredLen;
+
+  // atan2(x, y) porque en este sistema heading 0° = norte = +Y, y 90° = este = +X.
+  const desiredHeadingDeg = (Cesium.Math.toDegrees(Math.atan2(desiredX, desiredY)) + 360) % 360;
+
+  // Gira carState.heading hacia desiredHeadingDeg por el camino más corto,
+  // a una velocidad angular acotada (nunca un salto instantáneo de heading).
+  let diff = ((desiredHeadingDeg - carState.heading + 540) % 360) - 180; // en (-180, 180]
+  const maxTurnThisFrame = STREET_AUTOPILOT_MAX_TURN_DEG_S * intensity * strength * dt;
+  const turnStep = Math.max(-maxTurnThisFrame, Math.min(maxTurnThisFrame, diff));
+  carState.heading = (carState.heading + turnStep + 360) % 360;
+
+  // Tracción mínima: si el auto está descarrilado y casi parado (soltó el
+  // acelerador o frenó a fondo), corregir solo el heading no sirve de nada
+  // porque no hay movimiento que redirigir. El autopilot le da un mínimo de
+  // avance —como el propio auto "decidiera" acelerar un poco para volver
+  // al carril—, nunca marcha atrás y nunca por encima del input real del
+  // jugador si este ya pide más velocidad.
+  const minTraction = STREET_AUTOPILOT_MIN_TRACTION_KMH * intensity * strength;
+  if (Math.abs(carState.speed) < minTraction){
+    carState.speed = minTraction;
+  }
 }
 
 /**
