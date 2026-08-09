@@ -1568,6 +1568,16 @@ const steeringSensitivitySlider = document.getElementById("steeringSensitivitySl
 const steeringSensitivityValue = document.getElementById("steeringSensitivityValue");
 const cameraHeightSlider = document.getElementById("cameraHeightSlider");
 const cameraHeightValue = document.getElementById("cameraHeightValue");
+const thirdPersonZoomSlider = document.getElementById("thirdPersonZoomSlider");
+const thirdPersonZoomValue = document.getElementById("thirdPersonZoomValue");
+const fovSlider = document.getElementById("fovSlider");
+const fovValue = document.getElementById("fovValue");
+const cameraFollowDelaySlider = document.getElementById("cameraFollowDelaySlider");
+const cameraFollowDelayValue = document.getElementById("cameraFollowDelayValue");
+const cameraLookBlendSlider = document.getElementById("cameraLookBlendSlider");
+const cameraLookBlendValue = document.getElementById("cameraLookBlendValue");
+const freeLookReturnDelaySlider = document.getElementById("freeLookReturnDelaySlider");
+const freeLookReturnDelayValue = document.getElementById("freeLookReturnDelayValue");
 const lowestSettingsBtn = document.getElementById("lowestSettingsBtn");
 
 function openSettings(){
@@ -1682,6 +1692,62 @@ steeringSensitivitySlider.addEventListener("input", () => {
 cameraHeightSlider.addEventListener("input", () => {
   gdSettings.cameraHeight = Number(cameraHeightSlider.value);
   cameraHeightValue.textContent = `${Number(cameraHeightSlider.value).toFixed(1)} m`;
+});
+
+/**
+ * Zoom de cámara (3ra persona) — GeoDrive: settings.thirdPersonZoom.
+ * Divide la distancia detrás/arriba del auto: <1 aleja la cámara,
+ * >1 la acerca.
+ */
+thirdPersonZoomSlider.addEventListener("input", () => {
+  gdSettings.thirdPersonZoom = Number(thirdPersonZoomSlider.value);
+  thirdPersonZoomValue.textContent = `${Number(thirdPersonZoomSlider.value).toFixed(2)}×`;
+});
+
+/**
+ * Campo de visión (FOV) — GeoDrive: settings.fov. Se aplica cada frame al
+ * frustum de la cámara de Cesium (ver updateCarEntityAndCamera).
+ */
+fovSlider.addEventListener("input", () => {
+  gdSettings.fov = Number(fovSlider.value);
+  fovValue.textContent = `${fovSlider.value}°`;
+});
+
+/**
+ * Delay de seguimiento de cámara — GeoDrive: settings.cameraFollowDelay.
+ * 1.0 = feel original de GeoDrive; valores más altos = más lag ("dreamy"),
+ * más bajos = más ágil/snappy en las curvas.
+ */
+cameraFollowDelaySlider.addEventListener("input", () => {
+  gdSettings.cameraFollowDelay = Number(cameraFollowDelaySlider.value);
+  cameraFollowDelayValue.textContent = Number(cameraFollowDelaySlider.value).toFixed(2);
+});
+
+/**
+ * Mezcla con horizonte — GeoDrive: settings.cameraLookBlend. 0 = la cámara
+ * siempre mira al auto (default); 1 = mira derecho hacia el horizonte en la
+ * dirección del heading (look cinematográfico); intermedios mezclan ambas.
+ */
+cameraLookBlendSlider.addEventListener("input", () => {
+  gdSettings.cameraLookBlend = Number(cameraLookBlendSlider.value);
+  cameraLookBlendValue.textContent = Number(cameraLookBlendSlider.value).toFixed(2);
+});
+
+/**
+ * Delay de retorno del free-look — GeoDrive: settings.freeLookReturnDelay.
+ * Segundos sin arrastrar antes de que la cámara vuelva sola al centro. El
+ * extremo derecho del slider (31) representa "Never" (Infinity) — igual
+ * que en GeoDrive — y desactiva el retorno automático por completo.
+ */
+freeLookReturnDelaySlider.addEventListener("input", () => {
+  const n = Number(freeLookReturnDelaySlider.value);
+  if (n >= 31) {
+    gdSettings.freeLookReturnDelay = Infinity;
+    freeLookReturnDelayValue.textContent = "Nunca";
+  } else {
+    gdSettings.freeLookReturnDelay = n;
+    freeLookReturnDelayValue.textContent = `${n.toFixed(1)} s`;
+  }
 });
 
 /**

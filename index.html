@@ -196,6 +196,46 @@
           </div>
 
           <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Zoom cámara (3ra persona)</span>
+              <span class="settings-row__value" id="thirdPersonZoomValue">1.00×</span>
+            </div>
+            <input type="range" class="gd-slider" id="thirdPersonZoomSlider" min="0.3" max="3" step="0.05" value="1.0">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Campo de visión (FOV)</span>
+              <span class="settings-row__value" id="fovValue">120°</span>
+            </div>
+            <input type="range" class="gd-slider" id="fovSlider" min="40" max="150" step="1" value="120">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Delay de seguimiento de cámara</span>
+              <span class="settings-row__value" id="cameraFollowDelayValue">2.00</span>
+            </div>
+            <input type="range" class="gd-slider" id="cameraFollowDelaySlider" min="0.2" max="6" step="0.1" value="2.0">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Mezcla con horizonte</span>
+              <span class="settings-row__value" id="cameraLookBlendValue">0.50</span>
+            </div>
+            <input type="range" class="gd-slider" id="cameraLookBlendSlider" min="0" max="1" step="0.05" value="0.5">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Delay de retorno del free-look</span>
+              <span class="settings-row__value" id="freeLookReturnDelayValue">1.2 s</span>
+            </div>
+            <input type="range" class="gd-slider" id="freeLookReturnDelaySlider" min="0" max="31" step="0.1" value="1.2">
+          </div>
+
+          <div class="settings-row">
             <button class="settings-panel__reset" id="lowestSettingsBtn" type="button">Rendimiento máximo (mínimos)</button>
           </div>
 
