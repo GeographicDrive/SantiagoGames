@@ -346,6 +346,18 @@ const gdSettings = {
                              // Subirla aleja la cámara de las mallas fotorrealistas cercanas
                              // (veredas, vehículos estacionados, postes) que de muy cerca se
                              // ven "dobladas"/distorsionadas por artefactos de fotogrametría.
+  fov: 120,                 // GeoDrive: settings.fov — campo de visión en grados, aplicado
+                             // cada frame al frustum de la cámara de Cesium.
+  cameraFollowDelay: 2.0,   // GeoDrive: settings.cameraFollowDelay — reemplaza a la constante
+                             // CAMERA_FOLLOW_DELAY fija; 1.0 = feel original, >1 más lag/
+                             // "dreamy", <1 más ágil/snappy.
+  cameraLookBlend: 0.5,     // GeoDrive: settings.cameraLookBlend — 0 = la cámara siempre
+                             // mira al auto; 1 = mira derecho hacia el horizonte en la
+                             // dirección del heading (look cinematográfico); intermedios
+                             // mezclan ambas direcciones.
+  thirdPersonZoom: 1.0,     // GeoDrive: settings.thirdPersonZoom — multiplicador de zoom de
+                             // la cámara de tercera persona (divide la distancia detrás/
+                             // arriba del auto; <1 aleja, >1 acerca).
   freeLookReturnDelay: 1.2, // Segundos sin arrastrar antes de que la cámara vuelva sola al
                              // centro (GeoDrive: Settings → Camera → "Free-Look Reset Delay").
                              // Poner Infinity desde el slider ("Never") desactiva el retorno.
@@ -1133,7 +1145,6 @@ const CAMERA_BACK_METERS = 9;   // distancia detrás del auto (no tiene lag: nun
 // que quede al ras de las mallas fotorrealistas cercanas (la "perspectiva
 // doblada" que se ve cuando la cámara casi toca un vehículo/objeto vecino).
 function getCameraUpMeters(){ return gdSettings.cameraHeight; }
-const CAMERA_FOLLOW_DELAY = 1.0; // 1.0 = feel original de GeoDrive; >1 más lag, <1 más ágil
 
 function bindDriveKey(key, prop){
   window.addEventListener("keydown", (e) => { if (e.key === key) driveInput[prop] = true; });
@@ -1210,7 +1221,7 @@ function updateCarEntityAndCamera(dt){
     let diff = targetHeadingRad - camSmoothHeadingRad;
     while (diff > Math.PI) diff -= 2 * Math.PI;
     while (diff < -Math.PI) diff += 2 * Math.PI;
-    const headingAlpha = 1.0 - Math.exp(-(6 / CAMERA_FOLLOW_DELAY) * dt);
+    const headingAlpha = 1.0 - Math.exp(-(6 / gdSettings.cameraFollowDelay) * dt);
     camSmoothHeadingRad += diff * headingAlpha;
   }
 
@@ -1223,8 +1234,11 @@ function updateCarEntityAndCamera(dt){
   // free-look (mismo enfoque que GeoDrive en su rama de vehículo
   // terrestre): back/up definen el radio y la elevación base "detrás y
   // arriba" del auto, y freeLook.yaw/pitch los rotan alrededor de eso.
-  const back = CAMERA_BACK_METERS;
-  const up = getCameraUpMeters();
+  // thirdPersonZoom (GeoDrive: settings.thirdPersonZoom) divide el radio:
+  // <1 aleja la cámara, >1 la acerca.
+  const zoom = Math.max(0.1, gdSettings.thirdPersonZoom || 1.0);
+  const back = CAMERA_BACK_METERS / zoom;
+  const up = getCameraUpMeters() / zoom;
   const orbitR = Math.sqrt(back * back + up * up);
   const baseEl = Math.atan2(up, back);
   // Clamp duro a ~85°: nunca dejar que la elevación cruce el polo, que es
@@ -1238,6 +1252,12 @@ function updateCarEntityAndCamera(dt){
   );
   const camPos = Cesium.Matrix4.multiplyByPoint(vehicleTransform, camOffset, new Cesium.Cartesian3());
 
+  // FOV (GeoDrive: settings.fov) — se aplica cada frame al frustum de la
+  // cámara para que un cambio desde Configuración se note al instante.
+  if (viewer.scene.camera.frustum && typeof viewer.scene.camera.frustum.fov !== "undefined"){
+    viewer.scene.camera.frustum.fov = Cesium.Math.toRadians(gdSettings.fov);
+  }
+
   // Apunta directo hacia el auto desde la posición de cámara calculada
   // (en vez de usar viewer.camera.lookAt, que deja la cámara "pegada" en
   // modo órbita) — así el drag/scroll del mouse para free-look sigue
@@ -1246,6 +1266,20 @@ function updateCarEntityAndCamera(dt){
   const dist = Cesium.Cartesian3.magnitude(toCar);
   if (dist > 0.01){
     const dir = Cesium.Cartesian3.normalize(toCar, new Cesium.Cartesian3());
+
+    // ── Horizon blend (GeoDrive: settings.cameraLookBlend) ────────────
+    // 0 = la cámara siempre mira al auto (default); 1 = mira derecho hacia
+    // el horizonte en la dirección del heading, nivelado con la altura de
+    // la cámara (look cinematográfico); valores intermedios mezclan ambas.
+    if (gdSettings.cameraLookBlend > 0){
+      const hRad = Cesium.Math.toRadians(carState.heading);
+      const localFwd = new Cesium.Cartesian3(Math.sin(hRad), Math.cos(hRad), 0);
+      const enuFrame = Cesium.Transforms.eastNorthUpToFixedFrame(camPos);
+      const worldFwd = Cesium.Matrix4.multiplyByPointAsVector(enuFrame, localFwd, new Cesium.Cartesian3());
+      Cesium.Cartesian3.normalize(worldFwd, worldFwd);
+      Cesium.Cartesian3.lerp(dir, worldFwd, gdSettings.cameraLookBlend, dir);
+      Cesium.Cartesian3.normalize(dir, dir);
+    }
     // "Up" LOCAL (ENU) en la posición del auto, no el eje Z global del
     // planeta: en latitudes como Santiago (-33°) ambos difieren bastante,
     // y usar el up global hacía que la cámara se viera rotada/"dada
