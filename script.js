@@ -346,7 +346,102 @@ const gdSettings = {
                              // Subirla aleja la cámara de las mallas fotorrealistas cercanas
                              // (veredas, vehículos estacionados, postes) que de muy cerca se
                              // ven "dobladas"/distorsionadas por artefactos de fotogrametría.
+  freeLookReturnDelay: 1.2, // Segundos sin arrastrar antes de que la cámara vuelva sola al
+                             // centro (GeoDrive: Settings → Camera → "Free-Look Reset Delay").
+                             // Poner Infinity desde el slider ("Never") desactiva el retorno.
 };
+
+/* ===================== FREE-LOOK / ORBIT CAMERA (portado de GeoDrive) =====
+   Mismo sistema que GeoDrive: el control nativo de Cesium para
+   rotar/inclinar/hacer zoom/trasladar el globo con el mouse/touch se
+   desactiva por completo (si no, arrastrar la pantalla mueve la Tierra en
+   vez de orbitar la cámara alrededor del auto). En su lugar, un listener de
+   pointer propio en el canvas acumula yaw/pitch, que se suman como offset
+   angular a la cámara chase-cam de tercera persona. Sin input, tras
+   freeLookReturnDelay segundos, yaw/pitch vuelven suavemente a 0 (efecto de
+   "centrado magnético"). */
+const freeLook = {
+  yaw: 0,       // grados; +derecha orbita la cámara hacia la derecha
+  pitch: 0,     // grados; +arriba inclina la cámara hacia arriba
+  idleTime: 0,  // segundos acumulados desde el último drag
+  dragging: false,
+  lastX: 0,
+  lastY: 0,
+  get RETURN_DELAY() { return gdSettings.freeLookReturnDelay; },
+  RETURN_SPRING: 3.5,  // rigidez del retorno exponencial (más alto = más rápido)
+  SENSITIVITY: 0.28,   // grados por píxel CSS arrastrado
+  PITCH_MIN: -10,       // límite inferior de elevación (leve vista "desde abajo")
+  PITCH_MAX: 65,        // se mantiene bajo 90° para que baseElevation + pitch nunca
+                          // cruce el polo (ver clamp de _el más abajo) — eso era lo
+                          // que mandaba la cámara "al espacio".
+  YAW_LIMIT: 150,        // límite de azimut (°) — no llega a dar la vuelta completa
+};
+
+/**
+ * initCesiumFreeLook — engancha los listeners de pointer/touch al canvas de
+ * Cesium para poder orbitar la cámara arrastrando. Debe llamarse DESPUÉS de
+ * crear `viewer`.
+ */
+function initCesiumFreeLook(){
+  if (!viewer) return;
+  const canvas = viewer.scene.canvas;
+
+  function startDrag(clientX, clientY, target){
+    if (target !== canvas) return; // no capturar drags que empiezan en botones/HUD
+    freeLook.dragging = true;
+    freeLook.idleTime = 0;
+    freeLook.lastX = clientX;
+    freeLook.lastY = clientY;
+  }
+
+  function moveDrag(clientX, clientY){
+    if (!freeLook.dragging) return;
+    const dx = (clientX - freeLook.lastX) * freeLook.SENSITIVITY;
+    const dy = -(clientY - freeLook.lastY) * freeLook.SENSITIVITY; // invertido: arrastrar arriba = mirar arriba
+    freeLook.lastX = clientX;
+    freeLook.lastY = clientY;
+
+    freeLook.yaw += dx;
+    freeLook.pitch += dy;
+    freeLook.pitch = Math.max(freeLook.PITCH_MIN, Math.min(freeLook.PITCH_MAX, freeLook.pitch));
+    freeLook.yaw = Math.max(-freeLook.YAW_LIMIT, Math.min(freeLook.YAW_LIMIT, freeLook.yaw));
+
+    freeLook.idleTime = 0;
+  }
+
+  function endDrag(){ freeLook.dragging = false; }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    startDrag(e.clientX, e.clientY, e.target);
+    e.preventDefault();
+  }, { passive: false });
+
+  window.addEventListener("pointermove", (e) => {
+    if (!freeLook.dragging) return;
+    moveDrag(e.clientX, e.clientY);
+    e.preventDefault();
+  }, { passive: false });
+
+  window.addEventListener("pointerup", endDrag);
+  window.addEventListener("pointercancel", endDrag);
+}
+
+/**
+ * updateFreeLookIdle — retorno elástico de yaw/pitch a 0 cuando no se está
+ * arrastrando y ya pasó freeLookReturnDelay segundos. Se llama una vez por
+ * frame desde el loop de conducción.
+ */
+function updateFreeLookIdle(dt){
+  if (freeLook.dragging) return;
+  freeLook.idleTime += dt;
+  if (freeLook.idleTime > freeLook.RETURN_DELAY){
+    const alpha = 1 - Math.exp(-freeLook.RETURN_SPRING * dt);
+    freeLook.yaw -= freeLook.yaw * alpha;
+    freeLook.pitch -= freeLook.pitch * alpha;
+    if (Math.abs(freeLook.yaw) < 0.02) freeLook.yaw = 0;
+    if (Math.abs(freeLook.pitch) < 0.02) freeLook.pitch = 0;
+  }
+}
 
 // Optimizaciones automáticas de GeoDrive que permanecen SIEMPRE activas,
 // sin exponerse en la UI (el usuario no necesita tocarlas manualmente).
@@ -447,6 +542,22 @@ async function initSimulation(gameName){
   viewer.clock.currentTime = dayTime;
   viewer.clock.shouldAnimate = false;
   viewer.scene.light = new Cesium.SunLight();
+
+  // Desactiva el control orbital/pan/zoom nativo de Cesium por completo:
+  // sin esto, tocar/arrastrar la pantalla mueve la Tierra (rotate/translate
+  // del globo) en vez de orbitar la cámara alrededor del auto. La cámara la
+  // maneja 100% la simulación (chase-cam) + el sistema de free-look propio
+  // (ver initCesiumFreeLook más abajo).
+  const sscc = viewer.scene.screenSpaceCameraController;
+  sscc.enableRotate = false;
+  sscc.enableTilt = false;
+  sscc.enableZoom = false;
+  sscc.enableLook = false;
+  sscc.enableTranslate = false;
+
+  // Engancha el drag propio (free-look/orbit) al canvas — debe ir después
+  // de crear el viewer.
+  initCesiumFreeLook();
 
   try {
     setLoadingStep("stepTiles", "active", "Descargando 3D Tiles fotorrealistas…");
@@ -1106,7 +1217,25 @@ function updateCarEntityAndCamera(dt){
   const vehicleTransform = Cesium.Transforms.headingPitchRollToFixedFrame(
     carPosition, new Cesium.HeadingPitchRoll(camSmoothHeadingRad, 0, 0)
   );
-  const camOffset = new Cesium.Cartesian3(0, -CAMERA_BACK_METERS, getCameraUpMeters());
+
+  // Offset de cámara en coordenadas polares (distancia/elevación/azimut)
+  // en vez de un Cartesian3 fijo, para poder sumarle yaw/pitch del
+  // free-look (mismo enfoque que GeoDrive en su rama de vehículo
+  // terrestre): back/up definen el radio y la elevación base "detrás y
+  // arriba" del auto, y freeLook.yaw/pitch los rotan alrededor de eso.
+  const back = CAMERA_BACK_METERS;
+  const up = getCameraUpMeters();
+  const orbitR = Math.sqrt(back * back + up * up);
+  const baseEl = Math.atan2(up, back);
+  // Clamp duro a ~85°: nunca dejar que la elevación cruce el polo, que es
+  // lo que en GeoDrive mandaba la cámara "al espacio" al orbitar arriba.
+  const el = Math.min(1.484, Math.max(0.04, baseEl + Cesium.Math.toRadians(freeLook.pitch)));
+  const yawR = Cesium.Math.toRadians(freeLook.yaw);
+  const camOffset = new Cesium.Cartesian3(
+     orbitR * Math.cos(el) * Math.sin(yawR),   // x = derecha
+    -orbitR * Math.cos(el) * Math.cos(yawR),   // y = -adelante (detrás)
+     orbitR * Math.sin(el)                      // z = arriba
+  );
   const camPos = Cesium.Matrix4.multiplyByPoint(vehicleTransform, camOffset, new Cesium.Cartesian3());
 
   // Apunta directo hacia el auto desde la posición de cámara calculada
@@ -1165,6 +1294,7 @@ function carAnimationLoop(timestampMs){
   carLastFrameTime = timestampMs;
 
   updateCarPhysics(dt);
+  updateFreeLookIdle(dt);
   updateCarEntityAndCamera(dt);
   updateNavMap();
   if (speedValueEl) speedValueEl.textContent = Math.round(Math.abs(carState.speed));
@@ -1221,6 +1351,10 @@ async function spawnAudiQuattro(){
   carState.heading = SPAWN_HEADING_DEG;
   carState.speed = 0;
   camSmoothHeadingRad = null;
+  freeLook.yaw = 0;
+  freeLook.pitch = 0;
+  freeLook.idleTime = 0;
+  freeLook.dragging = false;
 
   const carPosition = Cesium.Cartesian3.fromDegrees(SPAWN_LON, SPAWN_LAT, groundHeight);
   const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(SPAWN_HEADING_DEG), 0, 0);
