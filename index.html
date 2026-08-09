@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SantiagoGames — Selector</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+
+  <!--
+    NOTA DE DISEÑO:
+    Toda la UI de SantiagoGames debe ser profesional y minimalista.
+    Se utiliza un único color de fondo y un único color de contorno/acento
+    en toda la interfaz. Sin gradientes, sin ruido visual, sin decoración
+    innecesaria. Cada elemento cumple una sola función.
+
+    NOTA DE FLUJO:
+    Este es el único archivo HTML del proyecto (index.html) y NO debe
+    renombrarse. Al cargar la página se muestra SIEMPRE el selector de
+    juegos primero. La simulación 3D (CesiumJS) vive en el mismo documento
+    pero permanece oculta e inicializada solo cuando el usuario presiona
+    "Seleccionar" — nunca se ejecuta automáticamente al abrir la página.
+  -->
+
+  <!-- ============ PANTALLA 1: SELECTOR ============ -->
+  <div class="scene" id="selectorScreen">
+
+    <header class="brand">
+      <span class="brand__mark">SG</span>
+      <div class="brand__text">
+        <h1 class="brand__title">SantiagoGames</h1>
+        <p class="brand__sub">Selector de proyectos</p>
+      </div>
+    </header>
+
+    <main class="wheel-stage" aria-label="Selector de juegos">
+      <button class="nav-arrow nav-arrow--left" id="prevBtn" aria-label="Anterior">‹</button>
+
+      <div class="wheel" id="wheel"></div>
+
+      <button class="nav-arrow nav-arrow--right" id="nextBtn" aria-label="Siguiente">›</button>
+    </main>
+
+    <section class="detail" id="detail">
+      <div class="detail__index" id="detailIndex">01 / 13</div>
+      <h2 class="detail__title" id="detailTitle">—</h2>
+      <p class="detail__author" id="detailAuthor">—</p>
+      <p class="detail__desc" id="detailDesc">—</p>
+      <button class="detail__select" id="selectBtn">Seleccionar</button>
+    </section>
+
+    <footer class="foot">
+      <span>Usa las flechas o haz click en una tarjeta para rotar la rueda</span>
+    </footer>
+
+  </div>
+
+  <!-- ============ PANTALLA 2: SIMULACIÓN 3D (oculta hasta seleccionar) ============ -->
+  <div class="sim-screen" id="simScreen" hidden>
+    <div id="cesiumContainer"></div>
+
+    <!-- ============ PANTALLA DE CARGA ============ -->
+    <div class="loading-overlay" id="loadingOverlay">
+      <div class="loading-panel">
+        <div class="loading-panel__title">GENERANDO TRAMO VIAL</div>
+        <ul class="loading-steps">
+          <li class="loading-step" id="stepTiles">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">3D Tiles fotorrealistas (Google)</span>
+          </li>
+          <li class="loading-step" id="stepOsm">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">Visión de calle por color (sin descargas)</span>
+          </li>
+          <li class="loading-step" id="stepSpawn">
+            <span class="loading-step__mark">○</span>
+            <span class="loading-step__label">Posicionando Audi Quattro</span>
+          </li>
+        </ul>
+        <div class="loading-panel__note" id="loadingDetail">Iniciando… (streaming v2)</div>
+      </div>
+    </div>
+
+    <div class="hud">
+      <div class="hud__title" id="hudTitle">SANTIAGOGAMES</div>
+      <div class="hud__line">Spawn: 1988 Audi Quattro · -33.4721851, -70.7039520 · NNO (332.5°)</div>
+      <div class="hud__line" id="hudStatus">Cargando 3D Tiles…</div>
+      <div class="hud__line hud__line--repulsion-debug" id="repulsionDebugLine" hidden></div>
+    </div>
+
+    <div class="top-right-controls">
+      <button class="icon-btn" id="settingsBtn" aria-label="Configuración" title="Configuración">⚙</button>
+      <button class="back-link" id="backBtn">‹ Volver al selector</button>
+    </div>
+
+    <!-- ============ PANEL DE CONFIGURACIÓN (centralizado) ============ -->
+    <div class="settings-overlay" id="settingsOverlay" hidden>
+      <div class="settings-panel" role="dialog" aria-label="Configuración">
+        <div class="settings-panel__header">
+          <span>Configuración</span>
+          <button class="settings-panel__close" id="settingsCloseBtn" aria-label="Cerrar">×</button>
+        </div>
+
+        <div class="settings-panel__body">
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Screen Space Error</span>
+              <span class="settings-row__value" id="sseValue">2</span>
+            </div>
+            <input type="range" class="gd-slider" id="sseSlider" min="2" max="64" step="2" value="2">
+          </div>
+
+          <div class="settings-row settings-row--switch">
+            <span>Occlusion Culling</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="occlusionToggle" checked>
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="settings-row settings-row--switch">
+            <span>Depth Against Terrain</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="depthTerrainToggle" checked>
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Render Distance</span>
+              <span class="settings-row__value" id="renderDistanceValue">1000 m</span>
+            </div>
+            <input type="range" class="gd-slider" id="renderDistanceSlider" min="1000" max="60000" step="500" value="1000">
+          </div>
+
+          <div class="settings-row settings-row--switch">
+            <span>Dynamic Screen Space Error</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="dynamicSseToggle" checked>
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="settings-row" id="dynamicSseDensityRow">
+            <div class="settings-row__label">
+              <span>Dynamic SSE Density</span>
+              <span class="settings-row__value" id="dynamicSseDensityValue">0.02</span>
+            </div>
+            <input type="range" class="gd-slider" id="dynamicSseDensitySlider" min="0.0005" max="0.02" step="0.0005" value="0.02">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Resolution Scale</span>
+              <span class="settings-row__value" id="resolutionScaleValue">0.5×</span>
+            </div>
+            <input type="range" class="gd-slider" id="resolutionScaleSlider" min="0.5" max="1.5" step="0.05" value="0.5">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Repulsión de calles</span>
+              <span class="settings-row__value" id="streetRepulsionValue">50%</span>
+            </div>
+            <input type="range" class="gd-slider" id="streetRepulsionSlider" min="0" max="100" step="1" value="50">
+          </div>
+
+          <div class="settings-row settings-row--switch">
+            <span>Repulsión debug</span>
+            <label class="gd-toggle">
+              <input type="checkbox" id="repulsionDebugToggle">
+              <span class="gd-toggle__track"><span class="gd-toggle__thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Sensibilidad de giro</span>
+              <span class="settings-row__value" id="steeringSensitivityValue">0.30×</span>
+            </div>
+            <input type="range" class="gd-slider" id="steeringSensitivitySlider" min="0.3" max="2.5" step="0.05" value="0.3">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Altura de cámara</span>
+              <span class="settings-row__value" id="cameraHeightValue">10.0 m</span>
+            </div>
+            <input type="range" class="gd-slider" id="cameraHeightSlider" min="1.5" max="500" step="0.5" value="10.0">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Zoom cámara (3ra persona)</span>
+              <span class="settings-row__value" id="thirdPersonZoomValue">0.30×</span>
+            </div>
+            <input type="range" class="gd-slider" id="thirdPersonZoomSlider" min="0.3" max="3" step="0.05" value="0.3">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Campo de visión (FOV)</span>
+              <span class="settings-row__value" id="fovValue">138°</span>
+            </div>
+            <input type="range" class="gd-slider" id="fovSlider" min="40" max="150" step="1" value="138">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Delay de seguimiento de cámara</span>
+              <span class="settings-row__value" id="cameraFollowDelayValue">2.00</span>
+            </div>
+            <input type="range" class="gd-slider" id="cameraFollowDelaySlider" min="0.2" max="6" step="0.1" value="2.0">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Mezcla con horizonte</span>
+              <span class="settings-row__value" id="cameraLookBlendValue">0.00</span>
+            </div>
+            <input type="range" class="gd-slider" id="cameraLookBlendSlider" min="0" max="1" step="0.05" value="0">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Delay de retorno del free-look</span>
+              <span class="settings-row__value" id="freeLookReturnDelayValue">1.2 s</span>
+            </div>
+            <input type="range" class="gd-slider" id="freeLookReturnDelaySlider" min="0" max="31" step="0.1" value="1.2">
+          </div>
+
+          <div class="settings-row">
+            <button class="settings-panel__reset" id="lowestSettingsBtn" type="button">Rendimiento máximo (mínimos)</button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ NAVEGACIÓN: BUSCADOR + MINIMAPA (portado de GeoDrive) ============ -->
+    <div id="navSearchBar">
+      <input type="text" id="navSearchInput" placeholder="Buscar dirección o lugar…" autocomplete="off">
+      <button id="navSearchBtn" title="Buscar">🔍</button>
+    </div>
+
+    <div id="navMinimapOverlay">
+      <div id="navMinimapHeader">
+        <span id="navMinimapTitle">🗺️ Navegación</span>
+        <span id="navMinimapDistWrap">—</span>
+        <button id="navMinimapBtnMin" title="Minimizar">–</button>
+      </div>
+      <div id="navMinimapViewport">
+        <div id="navMinimap"></div>
+        <div id="navMinimapResizeHandle" title="Redimensionar"><svg viewBox="0 0 14 14"><path d="M14 0L0 14M14 6L6 14M14 12L12 14" stroke="#E8B93A" stroke-width="1.4"/></svg></div>
+        <div id="navMinimapVehicle">
+          <svg viewBox="0 0 20 28" width="20" height="28">
+            <polygon points="10,0 20,26 10,20 0,26" fill="#E8B93A" stroke="#121210" stroke-width="1.5" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div id="navMinimapNorth">N</div>
+      </div>
+      <div id="navMinimapFooter">
+        <span id="navMinimapDestLabel">Sin destino</span>
+        <div id="navMinimapZoomBtns">
+          <button id="navZoomIn">+</button>
+          <button id="navZoomOut">−</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ CONTROLES DE CONDUCCIÓN (portado de GeoDrive, modo Ground Vehicle) ============ -->
+    <div id="drivingControls">
+      <div id="dpadContainer" class="steering-module">
+        <div class="d-pad-btn" id="btnLeft">‹</div>
+        <div class="d-pad-btn" id="btnRight">›</div>
+      </div>
+      <div class="pedal-container" id="pedalWrapper">
+        <div class="pedal pedal-brake" id="btnBrake">FRENO</div>
+        <div class="pedal pedal-gas" id="btnGas">GAS</div>
+      </div>
+      <div id="speedReadout"><span id="speedValue">0</span><span class="speed-unit">km/h</span></div>
+    </div>
+  </div>
+
+<script src="script.js?v=streetrepulsion2"></script>
+</body>
+</html>
