@@ -617,12 +617,24 @@ function isWorldPointStreet(worldX, worldY){
   const screenPos = Cesium.SceneTransforms.worldToWindowCoordinates(viewer.scene, cartesian);
   if (!screenPos || !isFinite(screenPos.x) || !isFinite(screenPos.y)) return null;
 
+  // screenPos viene en píxeles CSS (canvas.clientWidth/Height), pero el
+  // framebuffer real que hay que leer con gl.readPixels puede tener un
+  // tamaño DISTINTO: no solo por devicePixelRatio, sino también por
+  // viewer.resolutionScale (gdSettings.resolutionScale, 0.5 por defecto
+  // para rendimiento) y por cualquier otro escalado interno de Cesium. Usar
+  // solo devicePixelRatio para convertir (como se hacía antes) asumía
+  // resolutionScale=1 y el punto calculado quedaba casi siempre fuera del
+  // buffer real → por eso isWorldPointStreet devolvía "sin datos" (null)
+  // todo el tiempo. La conversión correcta es la razón real entre el
+  // tamaño del framebuffer y el tamaño CSS del canvas, medida en vivo.
   const canvas = viewer.canvas;
-  const dpr = window.devicePixelRatio || 1;
-  const px = Math.round(screenPos.x * dpr);
+  if (!canvas.clientWidth || !canvas.clientHeight) return null; // canvas aún sin layout (frame inicial)
+  const scaleX = gl.drawingBufferWidth / canvas.clientWidth;
+  const scaleY = gl.drawingBufferHeight / canvas.clientHeight;
+  const px = Math.round(screenPos.x * scaleX);
   // WebGL lee el framebuffer con origen abajo-izquierda; las coordenadas de
   // pantalla de Cesium tienen origen arriba-izquierda: hay que invertir Y.
-  const py = Math.round(gl.drawingBufferHeight - screenPos.y * dpr);
+  const py = Math.round(gl.drawingBufferHeight - screenPos.y * scaleY);
   if (px < 0 || py < 0 || px >= gl.drawingBufferWidth || py >= gl.drawingBufferHeight) return null;
 
   try {
