@@ -1158,8 +1158,8 @@ function _closestPointOnSegment(px, py, ax, ay, bx, by){
  * cercano y su semiancho real (ROAD_WIDTH_BY_TYPE), o null si no hay
  * ninguna vía cargada cerca.
  */
-function findNearestRoadSurface(px, py){
-  const R = STREET_REPULSION_SEARCH_RADIUS_METERS;
+function findNearestRoadSurface(px, py, maxRadius){
+  const R = maxRadius; // Infinity = sin descarte por caja (ver fallback más abajo)
   let best = null;
   let bestDistSq = Infinity;
 
@@ -1172,9 +1172,12 @@ function findNearestRoadSurface(px, py){
 
       for (let i = 0; i < xy.length - 1; i++){
         const a = xy[i], b = xy[i + 1];
-        // Descarte rápido por caja delimitadora antes de la distancia real.
-        if (Math.min(a.x, b.x) - px > R || px - Math.max(a.x, b.x) > R) continue;
-        if (Math.min(a.y, b.y) - py > R || py - Math.max(a.y, b.y) > R) continue;
+        // Descarte rápido por caja delimitadora antes de la distancia real
+        // (se salta por completo cuando R = Infinity, ver fallback).
+        if (R !== Infinity){
+          if (Math.min(a.x, b.x) - px > R || px - Math.max(a.x, b.x) > R) continue;
+          if (Math.min(a.y, b.y) - py > R || py - Math.max(a.y, b.y) > R) continue;
+        }
 
         const c = _closestPointOnSegment(px, py, a.x, a.y, b.x, b.y);
         if (c.distSq < bestDistSq){
@@ -1208,8 +1211,17 @@ function updateStreetRepulsion(dt){
   if (!intensity || intensity <= 0) return;
 
   const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
-  const surface = findNearestRoadSurface(carX, carY);
-  if (!surface) return; // nada cargado cerca todavía (p.ej. justo al spawnear)
+
+  // Primero, la búsqueda barata (con descarte por caja a 40 m) — cubre el
+  // caso normal (auto cerca de la calle) sin costo extra. Si el auto ya
+  // se alejó más de eso (p. ej. quedó dentro de un edificio/patio lejos
+  // de la vía), se hace una segunda pasada SIN límite de radio: sigue
+  // acotada a los mismos tiles ya cargados (roadTiles), así que no
+  // recorre "todo el mapa" — solo evita el early-out que antes dejaba la
+  // repulsión sin efecto cuando el auto estaba demasiado lejos.
+  let surface = findNearestRoadSurface(carX, carY, STREET_REPULSION_SEARCH_RADIUS_METERS);
+  if (!surface) surface = findNearestRoadSurface(carX, carY, Infinity);
+  if (!surface) return; // no hay ninguna calle cargada en absoluto todavía (p.ej. justo al spawnear)
 
   const excess = surface.distance - surface.halfWidth; // metros fuera del borde de calzada
   if (excess <= 0) return; // ya está dentro del ancho real de la calle: sin repulsión
