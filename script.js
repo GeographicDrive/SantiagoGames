@@ -147,6 +147,14 @@ const SPAWN_LON = -70.7039520;
 const SPAWN_LAT = -33.4721851;
 const SPAWN_HEADING_DEG = 332.5; // NNO, dentro de 330–335°
 const AUDI_MODEL_URL = "models/1988_audi_quattro.glb";
+// El eje "adelante" con el que está exportado el .glb no coincide con el
+// eje +Y (norte a heading 0) que espera Cesium: a heading 0 el modelo
+// quedaba mirando hacia la DERECHA (este) en vez de hacia adelante. Se
+// corrige sumando este offset fijo a CUALQUIER heading aplicado al
+// entity/orientación del auto (spawn y cada frame en
+// updateCarEntityAndCamera), sin tocar carState.heading (que sigue
+// siendo la dirección real de manejo/cámara/GPS).
+const MODEL_HEADING_OFFSET_DEG = -90;
 let audiEntity = null;
 
 /* ============ TRAMO VIAL (archivo local precomputado + elevación real) ===
@@ -191,7 +199,7 @@ const ROAD_WORLD_RADIUS_METERS = 45000;      // límite máximo del mundo/mapa
 // panel de Configuración (gdSettings.roadTileMargin) — arranca en 1 por
 // defecto (rendimiento razonable) y se puede bajar a 0 para el modo
 // "mínimos".
-let ROAD_TILE_LOAD_MARGIN_TILES = 1;
+let ROAD_TILE_LOAD_MARGIN_TILES = 0; // 0 = 1×1 tiles (valor por defecto validado, ver captura)
 const ROAD_STREAM_CHECK_INTERVAL_MS = 500;   // cada cuánto se revisa el tile actual del auto
 const ROAD_SAMPLE_BATCH = 250;        // nodos por tanda en sampleHeightMostDetailed
 const ROAD_SAMPLE_CONCURRENT_BATCHES = 6; // tandas en vuelo al mismo tiempo (el cuello de botella es red, no CPU)
@@ -321,41 +329,25 @@ let tileset = null; // referencia global al 3D Tileset, usada por el panel de Co
    memoria de tiles, etc). Aquí se centralizan en un único objeto y un único
    menú, en vez de repartirse en varias pestañas como en GeoDrive. */
 const gdSettings = {
-  // NOTA DE RENDIMIENTO: todos estos valores por defecto quedaron en el
-  // extremo "más liviano" a propósito (SSE alto = menos detalle, render
-  // distance corto, resolución reducida) para que la simulación arranque
-  // siempre fluida. El usuario puede subir la calidad desde el panel de
-  // Configuración si su equipo aguanta más.
-  screenSpaceError: 48,     // GeoDrive: maximumScreenSpaceError (antes 16 = "Normal/alto detalle";
-                             // 48 = bajo detalle, mucho más liviano para GPU/CPU)
+  // Valores por defecto = los últimos configurados/validados por el
+  // usuario (ver captura de Configuración): SSE mínimo (máximo detalle),
+  // render distance corto, resolución al 50%, cámara alta y muy alejada
+  // (zoom 0.30x) con FOV amplio (138°) para vista aérea tipo GTA.
+  screenSpaceError: 2,      // GeoDrive: maximumScreenSpaceError — 2 = máximo detalle
   occlusionCulling: true,   // GeoDrive: cullWithChildrenBounds + skipLevelOfDetail + grid trim
   depthAgainstTerrain: true,// GeoDrive: scene.globe.depthTestAgainstTerrain
-  renderDistance: 4000,     // GeoDrive: gp3dtRenderDistance (metros) — antes 60000 (pensado
-                             // solo para la vista panorámica inicial). A nivel de calle casi
-                             // no se ve más allá de un par de km, así que arrancar corto
-                             // evita procesar/renderizar tiles fotorrealistas innecesarios.
+  renderDistance: 1000,     // GeoDrive: gp3dtRenderDistance (metros)
   dynamicScreenSpaceError: true,        // GeoDrive: mismo toggle del panel de Configuración
-  dynamicScreenSpaceErrorDensity: 0.00278, // GeoDrive: mismo slider del panel de Configuración
-  resolutionScale: 0.75,    // Escala de resolución de render (viewer.resolutionScale). En
-                             // pantallas hiDPI/retina, Cesium por defecto renderiza a
-                             // devicePixelRatio completo (2x+ píxeles reales) — bajarlo a
-                             // 0.75 por defecto corta bastante carga de GPU con una pérdida
-                             // de nitidez menor. Subible a 1.0 desde Configuración.
-  steeringSensitivity: 1.0, // Multiplicador de CAR.baseTurnRate — ajustable desde Configuración.
-  cameraHeight: 3.8,        // Metros de altura de la cámara sobre el auto (CAMERA_UP_METERS).
-                             // Subirla aleja la cámara de las mallas fotorrealistas cercanas
-                             // (veredas, vehículos estacionados, postes) que de muy cerca se
-                             // ven "dobladas"/distorsionadas por artefactos de fotogrametría.
-  fov: 120,                 // GeoDrive: settings.fov — campo de visión en grados, aplicado
+  dynamicScreenSpaceErrorDensity: 0.02, // GeoDrive: mismo slider del panel de Configuración
+  resolutionScale: 0.5,     // Escala de resolución de render (viewer.resolutionScale).
+  steeringSensitivity: 0.3, // Multiplicador de CAR.baseTurnRate — ajustable desde Configuración.
+  cameraHeight: 10.0,       // Metros de altura de la cámara sobre el auto (CAMERA_UP_METERS).
+  fov: 138,                 // GeoDrive: settings.fov — campo de visión en grados, aplicado
                              // cada frame al frustum de la cámara de Cesium.
-  cameraFollowDelay: 2.0,   // GeoDrive: settings.cameraFollowDelay — reemplaza a la constante
-                             // CAMERA_FOLLOW_DELAY fija; 1.0 = feel original, >1 más lag/
-                             // "dreamy", <1 más ágil/snappy.
-  cameraLookBlend: 0.5,     // GeoDrive: settings.cameraLookBlend — 0 = la cámara siempre
-                             // mira al auto; 1 = mira derecho hacia el horizonte en la
-                             // dirección del heading (look cinematográfico); intermedios
-                             // mezclan ambas direcciones.
-  thirdPersonZoom: 1.0,     // GeoDrive: settings.thirdPersonZoom — multiplicador de zoom de
+  cameraFollowDelay: 2.0,   // GeoDrive: settings.cameraFollowDelay
+  cameraLookBlend: 0.0,     // GeoDrive: settings.cameraLookBlend — 0 = la cámara siempre
+                             // mira al auto (sin mezcla con el horizonte).
+  thirdPersonZoom: 0.3,     // GeoDrive: settings.thirdPersonZoom — multiplicador de zoom de
                              // la cámara de tercera persona (divide la distancia detrás/
                              // arriba del auto; <1 aleja, >1 acerca).
   freeLookReturnDelay: 1.2, // Segundos sin arrastrar antes de que la cámara vuelva sola al
@@ -535,9 +527,14 @@ async function initSimulation(gameName){
     globe: false,
   });
 
-  viewer.scene.skyAtmosphere.show = false;
+  // Cielo de DÍA (azul), no negro/nocturno: con globe:false Cesium igual
+  // expone scene.skyAtmosphere (usa el elipsoide WGS84, no depende del
+  // globo en sí), así que se puede dejar activo. backgroundColor pasa a un
+  // celeste de día como respaldo para cuando la cámara mira por encima del
+  // halo de atmósfera (p.ej. con la cámara muy alejada/alta, zoom bajo).
+  if (viewer.scene.skyAtmosphere) viewer.scene.skyAtmosphere.show = true;
   viewer.scene.fog.enabled = false;
-  viewer.scene.backgroundColor = Cesium.Color.fromCssColorString("#121210");
+  viewer.scene.backgroundColor = Cesium.Color.fromCssColorString("#8ec9f0");
 
   // Ambiente de DÍA fijo: sin esto, Cesium calcula la posición del sol con
   // la hora real del sistema (viewer.clock.currentTime = "ahora"), así que
@@ -1209,7 +1206,7 @@ function updateCarEntityAndCamera(dt){
 
   const groundHeight = _lastCarGroundHeight ?? 0;
   const carPosition = Cesium.Cartesian3.fromDegrees(carState.lng, carState.lat, groundHeight);
-  const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(carState.heading), 0, 0);
+  const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(carState.heading + MODEL_HEADING_OFFSET_DEG), 0, 0);
   audiEntity.position = carPosition;
   audiEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(carPosition, hpr);
 
@@ -1391,7 +1388,7 @@ async function spawnAudiQuattro(){
   freeLook.dragging = false;
 
   const carPosition = Cesium.Cartesian3.fromDegrees(SPAWN_LON, SPAWN_LAT, groundHeight);
-  const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(SPAWN_HEADING_DEG), 0, 0);
+  const hpr = new Cesium.HeadingPitchRoll(Cesium.Math.toRadians(SPAWN_HEADING_DEG + MODEL_HEADING_OFFSET_DEG), 0, 0);
   const orientation = Cesium.Transforms.headingPitchRollQuaternion(carPosition, hpr);
 
   if (audiEntity) {

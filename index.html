@@ -118,9 +118,9 @@
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Screen Space Error</span>
-              <span class="settings-row__value" id="sseValue">48</span>
+              <span class="settings-row__value" id="sseValue">2</span>
             </div>
-            <input type="range" class="gd-slider" id="sseSlider" min="2" max="64" step="2" value="48">
+            <input type="range" class="gd-slider" id="sseSlider" min="2" max="64" step="2" value="2">
           </div>
 
           <div class="settings-row settings-row--switch">
@@ -142,9 +142,9 @@
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Render Distance</span>
-              <span class="settings-row__value" id="renderDistanceValue">4000 m</span>
+              <span class="settings-row__value" id="renderDistanceValue">1000 m</span>
             </div>
-            <input type="range" class="gd-slider" id="renderDistanceSlider" min="1000" max="60000" step="500" value="4000">
+            <input type="range" class="gd-slider" id="renderDistanceSlider" min="1000" max="60000" step="500" value="1000">
           </div>
 
           <div class="settings-row settings-row--switch">
@@ -158,57 +158,57 @@
           <div class="settings-row" id="dynamicSseDensityRow">
             <div class="settings-row__label">
               <span>Dynamic SSE Density</span>
-              <span class="settings-row__value" id="dynamicSseDensityValue">0.00278</span>
+              <span class="settings-row__value" id="dynamicSseDensityValue">0.02</span>
             </div>
-            <input type="range" class="gd-slider" id="dynamicSseDensitySlider" min="0.0005" max="0.02" step="0.0005" value="0.00278">
+            <input type="range" class="gd-slider" id="dynamicSseDensitySlider" min="0.0005" max="0.02" step="0.0005" value="0.02">
           </div>
 
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Resolution Scale</span>
-              <span class="settings-row__value" id="resolutionScaleValue">0.75×</span>
+              <span class="settings-row__value" id="resolutionScaleValue">0.5×</span>
             </div>
-            <input type="range" class="gd-slider" id="resolutionScaleSlider" min="0.5" max="1.5" step="0.05" value="0.75">
+            <input type="range" class="gd-slider" id="resolutionScaleSlider" min="0.5" max="1.5" step="0.05" value="0.5">
           </div>
 
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Radio de calles cargadas</span>
-              <span class="settings-row__value" id="roadTileMarginValue">3×3 tiles</span>
+              <span class="settings-row__value" id="roadTileMarginValue">1×1 tiles</span>
             </div>
-            <input type="range" class="gd-slider" id="roadTileMarginSlider" min="0" max="2" step="1" value="1">
+            <input type="range" class="gd-slider" id="roadTileMarginSlider" min="0" max="2" step="1" value="0">
           </div>
 
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Sensibilidad de giro</span>
-              <span class="settings-row__value" id="steeringSensitivityValue">1.0×</span>
+              <span class="settings-row__value" id="steeringSensitivityValue">0.30×</span>
             </div>
-            <input type="range" class="gd-slider" id="steeringSensitivitySlider" min="0.3" max="2.5" step="0.05" value="1.0">
+            <input type="range" class="gd-slider" id="steeringSensitivitySlider" min="0.3" max="2.5" step="0.05" value="0.3">
           </div>
 
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Altura de cámara</span>
-              <span class="settings-row__value" id="cameraHeightValue">3.8 m</span>
+              <span class="settings-row__value" id="cameraHeightValue">10.0 m</span>
             </div>
-            <input type="range" class="gd-slider" id="cameraHeightSlider" min="1.5" max="500" step="0.5" value="3.8">
+            <input type="range" class="gd-slider" id="cameraHeightSlider" min="1.5" max="500" step="0.5" value="10.0">
           </div>
 
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Zoom cámara (3ra persona)</span>
-              <span class="settings-row__value" id="thirdPersonZoomValue">1.00×</span>
+              <span class="settings-row__value" id="thirdPersonZoomValue">0.30×</span>
             </div>
-            <input type="range" class="gd-slider" id="thirdPersonZoomSlider" min="0.3" max="3" step="0.05" value="1.0">
+            <input type="range" class="gd-slider" id="thirdPersonZoomSlider" min="0.3" max="3" step="0.05" value="0.3">
           </div>
 
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Campo de visión (FOV)</span>
-              <span class="settings-row__value" id="fovValue">120°</span>
+              <span class="settings-row__value" id="fovValue">138°</span>
             </div>
-            <input type="range" class="gd-slider" id="fovSlider" min="40" max="150" step="1" value="120">
+            <input type="range" class="gd-slider" id="fovSlider" min="40" max="150" step="1" value="138">
           </div>
 
           <div class="settings-row">
@@ -222,9 +222,9 @@
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Mezcla con horizonte</span>
-              <span class="settings-row__value" id="cameraLookBlendValue">0.50</span>
+              <span class="settings-row__value" id="cameraLookBlendValue">0.00</span>
             </div>
-            <input type="range" class="gd-slider" id="cameraLookBlendSlider" min="0" max="1" step="0.05" value="0.5">
+            <input type="range" class="gd-slider" id="cameraLookBlendSlider" min="0" max="1" step="0.05" value="0">
           </div>
 
           <div class="settings-row">
