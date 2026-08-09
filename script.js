@@ -186,7 +186,12 @@ let audiEntity = null;
 //     (roadTiles) por si el auto vuelve, así no hay que re-pedir el archivo
 //     ni re-muestrear elevación.
 const ROAD_WORLD_RADIUS_METERS = 45000;      // límite máximo del mundo/mapa
-const ROAD_TILE_LOAD_MARGIN_TILES = 1;       // anillo de tiles vecinos (1 = grilla 3×3)
+// Anillo de tiles vecinos alrededor del auto (0 = solo el tile actual,
+// 1 = grilla 3×3, 2 = grilla 5×5). Ahora es ajustable en vivo desde el
+// panel de Configuración (gdSettings.roadTileMargin) — arranca en 1 por
+// defecto (rendimiento razonable) y se puede bajar a 0 para el modo
+// "mínimos".
+let ROAD_TILE_LOAD_MARGIN_TILES = 1;
 const ROAD_STREAM_CHECK_INTERVAL_MS = 500;   // cada cuánto se revisa el tile actual del auto
 const ROAD_SAMPLE_BATCH = 250;        // nodos por tanda en sampleHeightMostDetailed
 const ROAD_SAMPLE_CONCURRENT_BATCHES = 6; // tandas en vuelo al mismo tiempo (el cuello de botella es red, no CPU)
@@ -205,25 +210,22 @@ const ROAD_WIDTH_BY_TYPE = {
 const ROAD_WIDTH_DEFAULT = 6;
 
 /* ---- Estado del sistema de carga de calles por tile ----
-   roadTiles      : Map(tileKey -> { tx, ty, status, entities:[], roads:[] })
-                    — un registro por tile de 2×2 km. `roads` guarda las
-                    vías YA elevadas (sobrevive a la descarga del tile, para
-                    no re-pedir el archivo ni re-muestrear elevación si el
-                    auto vuelve a esa zona). `entities` son las que están
-                    actualmente puestas en la escena (vacío si el tile está
-                    descargado pero sigue en caché).
-   roadEntityByWay: Map(wayId -> entity) — evita duplicar geometría.
+   roadTiles : Map(tileKey -> { tx, ty, status, primitives:[], roads:[] })
+               — un registro por tile de 2×2 km. `roads` guarda las vías
+               YA elevadas (sobrevive a la descarga del tile, para no
+               re-pedir el archivo ni re-muestrear elevación si el auto
+               vuelve a esa zona). `primitives` son los 2 Cesium.Primitive
+               (relleno + contorno, con TODAS las vías del tile
+               combinadas/batcheadas en cada uno) actualmente puestos en
+               la escena — vacío si el tile está descargado pero sigue en
+               caché.
 */
 let roadTiles = new Map();
-let roadEntityByWay = new Map();
 let roadStreamingActive = false;
 let roadStreamTimerId = null;
 let lastStreamCarTx = null;
 let lastStreamCarTy = null;
 let roadStreamStats = { loaded: 0, loading: 0 };
-
-// Mantenido por compatibilidad con el resto del código (p.ej. limpieza total).
-let roadEntities = [];
 
 function yieldToMain(){
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -319,14 +321,26 @@ let tileset = null; // referencia global al 3D Tileset, usada por el panel de Co
    memoria de tiles, etc). Aquí se centralizan en un único objeto y un único
    menú, en vez de repartirse en varias pestañas como en GeoDrive. */
 const gdSettings = {
-  screenSpaceError: 16,     // GeoDrive: maximumScreenSpaceError (preset "Normal")
+  // NOTA DE RENDIMIENTO: todos estos valores por defecto quedaron en el
+  // extremo "más liviano" a propósito (SSE alto = menos detalle, render
+  // distance corto, resolución reducida) para que la simulación arranque
+  // siempre fluida. El usuario puede subir la calidad desde el panel de
+  // Configuración si su equipo aguanta más.
+  screenSpaceError: 48,     // GeoDrive: maximumScreenSpaceError (antes 16 = "Normal/alto detalle";
+                             // 48 = bajo detalle, mucho más liviano para GPU/CPU)
   occlusionCulling: true,   // GeoDrive: cullWithChildrenBounds + skipLevelOfDetail + grid trim
   depthAgainstTerrain: true,// GeoDrive: scene.globe.depthTestAgainstTerrain
-  renderDistance: 60000,    // GeoDrive: gp3dtRenderDistance (metros) — alto por
-                             // defecto para no ocultar el tileset durante la
-                             // vista panorámica inicial (cámara a 60 km de altura)
+  renderDistance: 4000,     // GeoDrive: gp3dtRenderDistance (metros) — antes 60000 (pensado
+                             // solo para la vista panorámica inicial). A nivel de calle casi
+                             // no se ve más allá de un par de km, así que arrancar corto
+                             // evita procesar/renderizar tiles fotorrealistas innecesarios.
   dynamicScreenSpaceError: true,        // GeoDrive: mismo toggle del panel de Configuración
   dynamicScreenSpaceErrorDensity: 0.00278, // GeoDrive: mismo slider del panel de Configuración
+  resolutionScale: 0.75,    // Escala de resolución de render (viewer.resolutionScale). En
+                             // pantallas hiDPI/retina, Cesium por defecto renderiza a
+                             // devicePixelRatio completo (2x+ píxeles reales) — bajarlo a
+                             // 0.75 por defecto corta bastante carga de GPU con una pérdida
+                             // de nitidez menor. Subible a 1.0 desde Configuración.
 };
 
 // Optimizaciones automáticas de GeoDrive que permanecen SIEMPRE activas,
@@ -627,40 +641,95 @@ async function sampleRoadElevations(roads){
 
 /**
  * buildRoadMeshesForTile — con las alturas ya calculadas, genera la malla
- * "corridor" de cada vía del tile y la agrega tanto al registro del tile
- * (para poder descargarla después) como al índice global roadEntityByWay
- * (reutilizado para no duplicar geometría si el tile se recarga).
+ * de TODAS las vías del tile como Primitives BATCHEADOS (una geometría
+ * combinada por tile), en vez de una viewer.entities.add({corridor:...})
+ * por cada vía (como era antes).
+ *
+ * Por qué: la API de Entity de Cesium crea un primitive/draw-call propio
+ * por cada entity — con miles de calles cargadas a la vez (grilla de
+ * varios km² de Santiago) eso significaba miles de draw calls y, peor
+ * aún, toda esa geometría (con esquinas ROUNDED, que son las más caras de
+ * tesselar) se construía de golpe en el hilo principal apenas se cruzaba
+ * a un tile nuevo — el origen real de los congelamientos de varios
+ * segundos ("1 fotograma cada medio minuto").
+ *
+ * Acá en cambio se arma UN Cesium.Primitive para el relleno de todas las
+ * calles del tile y UN segundo Primitive para los contornos, combinando
+ * las geometrías de cada vía como GeometryInstance dentro de un mismo
+ * Primitive (Cesium las funde en un solo buffer de GPU). Resultado: 2
+ * draw calls por tile en vez de N×2 (N = cantidad de vías). También se
+ * cambió cornerType de ROUNDED a MITERED, mucho más barato de tesselar
+ * (sin arcos) y visualmente casi idéntico a la escala de una calle.
  */
 function buildRoadMeshesForTile(tile, roads){
+  const fillInstances = [];
+  const outlineInstances = [];
+
   roads.forEach((road) => {
     if (road.coordinates.length < 2) return;
-    if (roadEntityByWay.has(road.id)) {
-      const existing = roadEntityByWay.get(road.id);
-      if (!tile.entities.includes(existing)) tile.entities.push(existing);
-      return;
-    }
 
     const positions = road.coordinates.map((coord, i) =>
       Cesium.Cartesian3.fromDegrees(coord.lon, coord.lat, road.heights[i] + ROAD_SURFACE_OFFSET)
     );
-
     const width = ROAD_WIDTH_BY_TYPE[road.highwayType] ?? ROAD_WIDTH_DEFAULT;
 
-    const entity = viewer.entities.add({
-      name: road.name || `Vía OSM ${road.id} (${road.highwayType})`,
-      corridor: {
-        positions: positions,
-        width: width,
-        cornerType: Cesium.CornerType.ROUNDED,
-        material: Cesium.Color.fromCssColorString("#3B3B38"),
-        outline: true,
-        outlineColor: Cesium.Color.fromCssColorString("#E8B93A").withAlpha(0.35),
+    fillInstances.push(new Cesium.GeometryInstance({
+      geometry: new Cesium.CorridorGeometry({
+        positions,
+        width,
+        cornerType: Cesium.CornerType.MITERED,
+        vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
+      }),
+      attributes: {
+        color: Cesium.ColorGeometryInstanceAttribute.fromColor(
+          Cesium.Color.fromCssColorString("#3B3B38")
+        ),
       },
-    });
+      id: { tileKey: `${tile.tx}_${tile.ty}`, wayId: road.id },
+    }));
 
-    roadEntityByWay.set(road.id, entity);
-    tile.entities.push(entity);
+    outlineInstances.push(new Cesium.GeometryInstance({
+      geometry: new Cesium.CorridorOutlineGeometry({
+        positions,
+        width,
+        cornerType: Cesium.CornerType.MITERED,
+      }),
+      attributes: {
+        color: Cesium.ColorGeometryInstanceAttribute.fromColor(
+          Cesium.Color.fromCssColorString("#E8B93A").withAlpha(0.35)
+        ),
+      },
+      id: { tileKey: `${tile.tx}_${tile.ty}`, wayId: road.id },
+    }));
   });
+
+  if (fillInstances.length === 0) return;
+
+  // asynchronous:true → la tesselación de la geometría corre en un web
+  // worker (no bloquea el hilo principal); antes, con Entity + corridor
+  // ROUNDED, esto se hacía sincrónicamente en el frame donde se cruzaba
+  // de tile, y ahí era donde se producían los congelamientos largos.
+  const fillPrimitive = new Cesium.Primitive({
+    geometryInstances: fillInstances,
+    appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: false }),
+    asynchronous: true,
+  });
+
+  const maxLineWidth = viewer.scene.maximumAliasedLineWidth || 1;
+  const outlinePrimitive = new Cesium.Primitive({
+    geometryInstances: outlineInstances,
+    appearance: new Cesium.PerInstanceColorAppearance({
+      flat: true,
+      translucent: true,
+      renderState: { lineWidth: Math.min(1.5, maxLineWidth) },
+    }),
+    asynchronous: true,
+  });
+
+  viewer.scene.primitives.add(fillPrimitive);
+  viewer.scene.primitives.add(outlinePrimitive);
+
+  tile.primitives = [fillPrimitive, outlinePrimitive];
 }
 
 /**
@@ -720,21 +789,21 @@ async function loadRoadTile(tileKey){
 }
 
 /**
- * unloadRoadTile — saca de la escena las entidades de un tile que ya
- * quedó fuera de la grilla 3×3 alrededor del auto. Las vías ya elevadas
- * (tile.roads) se conservan en memoria a propósito, así reconstruir la
- * malla al volver es instantáneo y sin red.
+ * unloadRoadTile — saca de la escena los Primitives (fill + outline) de
+ * un tile que ya quedó fuera de la grilla alrededor del auto. Las vías ya
+ * elevadas (tile.roads) se conservan en memoria a propósito, así
+ * reconstruir la malla al volver es instantáneo y sin red (solo hay que
+ * volver a armar los Primitives, sin volver a pedir el archivo ni
+ * re-muestrear elevación).
  */
 function unloadRoadTile(tileKey){
   const tile = roadTiles.get(tileKey);
   if (!tile) return;
-  tile.entities.forEach((e) => {
-    viewer.entities.remove(e);
-    for (const [wayId, entity] of roadEntityByWay){
-      if (entity === e) roadEntityByWay.delete(wayId);
-    }
+  (tile.primitives || []).forEach((p) => {
+    if (viewer.scene.primitives.contains(p)) viewer.scene.primitives.remove(p);
+    else if (!p.isDestroyed()) p.destroy();
   });
-  tile.entities = [];
+  tile.primitives = [];
   roadTiles.delete(tileKey);
 }
 
@@ -786,7 +855,7 @@ function updateRoadStreaming(carLon, carLat){
   for (const key of neededKeys){
     if (roadTiles.has(key)) continue;
     const [tx, ty] = key.split("_").map(Number);
-    roadTiles.set(key, { tx, ty, status: "queued", entities: [], roads: null });
+    roadTiles.set(key, { tx, ty, status: "queued", primitives: [], roads: null });
     loadRoadTile(key); // en paralelo — cada tile es un solo fetch + una sola tanda de elevación
   }
 
@@ -855,7 +924,7 @@ async function generateInitialRoadPatch(spawnLon, spawnLat){
 
     for (const key of initialKeys){
       const [tx, ty] = key.split("_").map(Number);
-      roadTiles.set(key, { tx, ty, status: "queued", entities: [], roads: null });
+      roadTiles.set(key, { tx, ty, status: "queued", primitives: [], roads: null });
       if (key !== centerKey) backgroundKeys.push(key);
     }
 
@@ -1237,6 +1306,12 @@ function applyGdOptimizations(){
     }
   }
 
+  // Escala de resolución — reduce la cantidad real de píxeles que hay que
+  // sombrear por frame (impacto directo en GPU, sobre todo en hiDPI).
+  if (viewer) {
+    viewer.resolutionScale = gdSettings.resolutionScale;
+  }
+
   if (viewer && viewer.scene) viewer.scene.requestRender();
 }
 
@@ -1277,6 +1352,11 @@ const dynamicSseToggle = document.getElementById("dynamicSseToggle");
 const dynamicSseDensitySlider = document.getElementById("dynamicSseDensitySlider");
 const dynamicSseDensityValue = document.getElementById("dynamicSseDensityValue");
 const dynamicSseDensityRow = document.getElementById("dynamicSseDensityRow");
+const resolutionScaleSlider = document.getElementById("resolutionScaleSlider");
+const resolutionScaleValue = document.getElementById("resolutionScaleValue");
+const roadTileMarginSlider = document.getElementById("roadTileMarginSlider");
+const roadTileMarginValue = document.getElementById("roadTileMarginValue");
+const lowestSettingsBtn = document.getElementById("lowestSettingsBtn");
 
 function openSettings(){
   settingsOverlay.hidden = false;
@@ -1333,6 +1413,83 @@ dynamicSseToggle.addEventListener("change", () => {
 dynamicSseDensitySlider.addEventListener("input", () => {
   gdSettings.dynamicScreenSpaceErrorDensity = Number(dynamicSseDensitySlider.value);
   dynamicSseDensityValue.textContent = dynamicSseDensitySlider.value;
+  applyGdOptimizations();
+});
+
+/**
+ * Resolution Scale — controla viewer.resolutionScale (cantidad real de
+ * píxeles renderizados por frame). Bajarlo es una de las formas más
+ * directas de aliviar la GPU, sobre todo en pantallas hiDPI/retina.
+ */
+resolutionScaleSlider.addEventListener("input", () => {
+  gdSettings.resolutionScale = Number(resolutionScaleSlider.value);
+  resolutionScaleValue.textContent = `${resolutionScaleSlider.value}×`;
+  applyGdOptimizations();
+});
+
+/**
+ * Radio de calles cargadas — controla ROAD_TILE_LOAD_MARGIN_TILES (el
+ * anillo de tiles de 2×2 km alrededor del auto que se mantiene
+ * construido). Bajarlo reduce la cantidad de geometría de calles viva en
+ * la escena a la vez (menos Primitives por tile activo).
+ */
+function roadTileMarginLabel(margin){
+  const size = margin * 2 + 1;
+  return `${size}×${size} tiles`;
+}
+
+roadTileMarginSlider.addEventListener("input", () => {
+  ROAD_TILE_LOAD_MARGIN_TILES = Number(roadTileMarginSlider.value);
+  roadTileMarginValue.textContent = roadTileMarginLabel(ROAD_TILE_LOAD_MARGIN_TILES);
+  // Fuerza una reevaluación inmediata de la grilla de tiles con el nuevo
+  // margen (carga/descarga lo que corresponda ya mismo, no recién cuando
+  // el auto cruce de tile).
+  if (audiEntity && viewer){
+    lastStreamCarTx = null;
+    lastStreamCarTy = null;
+  }
+});
+
+/**
+ * Botón "Rendimiento máximo" — lleva todos los sliders/toggles a los
+ * valores más livianos disponibles de una sola vez, para cuando el equipo
+ * del usuario sigue sufriendo incluso con los valores por defecto.
+ */
+const LOWEST_SETTINGS = {
+  screenSpaceError: 64,
+  occlusionCulling: true,
+  depthAgainstTerrain: true,
+  renderDistance: 1500,
+  dynamicScreenSpaceError: true,
+  dynamicScreenSpaceErrorDensity: 0.02,
+  resolutionScale: 0.5,
+};
+
+lowestSettingsBtn.addEventListener("click", () => {
+  Object.assign(gdSettings, LOWEST_SETTINGS);
+  ROAD_TILE_LOAD_MARGIN_TILES = 0;
+
+  sseSlider.value = gdSettings.screenSpaceError;
+  sseValue.textContent = gdSettings.screenSpaceError;
+  occlusionToggle.checked = gdSettings.occlusionCulling;
+  depthTerrainToggle.checked = gdSettings.depthAgainstTerrain;
+  renderDistanceSlider.value = gdSettings.renderDistance;
+  renderDistanceValue.textContent = `${gdSettings.renderDistance} m`;
+  dynamicSseToggle.checked = gdSettings.dynamicScreenSpaceError;
+  dynamicSseDensitySlider.value = gdSettings.dynamicScreenSpaceErrorDensity;
+  dynamicSseDensityValue.textContent = gdSettings.dynamicScreenSpaceErrorDensity;
+  dynamicSseDensityRow.classList.remove("is-disabled");
+  dynamicSseDensitySlider.disabled = false;
+  resolutionScaleSlider.value = gdSettings.resolutionScale;
+  resolutionScaleValue.textContent = `${gdSettings.resolutionScale}×`;
+  roadTileMarginSlider.value = ROAD_TILE_LOAD_MARGIN_TILES;
+  roadTileMarginValue.textContent = roadTileMarginLabel(ROAD_TILE_LOAD_MARGIN_TILES);
+
+  _gdDistanceIsFar = null;
+  if (audiEntity && viewer){
+    lastStreamCarTx = null;
+    lastStreamCarTy = null;
+  }
   applyGdOptimizations();
 });
 

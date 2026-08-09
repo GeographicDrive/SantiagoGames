@@ -427,6 +427,26 @@ body{
   pointer-events: none;
 }
 
+.settings-panel__reset{
+  width:100%;
+  background:transparent;
+  border:1px solid var(--line);
+  color:var(--line);
+  border-radius:var(--radius);
+  padding:10px 12px;
+  font-size:11px;
+  letter-spacing:0.1em;
+  text-transform:uppercase;
+  font-weight:700;
+  cursor:pointer;
+  transition:background 0.2s ease, color 0.2s ease;
+}
+
+.settings-panel__reset:hover{
+  background:var(--line);
+  color:#121210;
+}
+
 .settings-row{
   display:flex;
   flex-direction:column;

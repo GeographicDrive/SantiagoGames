@@ -118,9 +118,9 @@
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Screen Space Error</span>
-              <span class="settings-row__value" id="sseValue">16</span>
+              <span class="settings-row__value" id="sseValue">48</span>
             </div>
-            <input type="range" class="gd-slider" id="sseSlider" min="2" max="64" step="2" value="16">
+            <input type="range" class="gd-slider" id="sseSlider" min="2" max="64" step="2" value="48">
           </div>
 
           <div class="settings-row settings-row--switch">
@@ -142,9 +142,9 @@
           <div class="settings-row">
             <div class="settings-row__label">
               <span>Render Distance</span>
-              <span class="settings-row__value" id="renderDistanceValue">60000 m</span>
+              <span class="settings-row__value" id="renderDistanceValue">4000 m</span>
             </div>
-            <input type="range" class="gd-slider" id="renderDistanceSlider" min="1000" max="60000" step="500" value="60000">
+            <input type="range" class="gd-slider" id="renderDistanceSlider" min="1000" max="60000" step="500" value="4000">
           </div>
 
           <div class="settings-row settings-row--switch">
@@ -161,6 +161,26 @@
               <span class="settings-row__value" id="dynamicSseDensityValue">0.00278</span>
             </div>
             <input type="range" class="gd-slider" id="dynamicSseDensitySlider" min="0.0005" max="0.02" step="0.0005" value="0.00278">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Resolution Scale</span>
+              <span class="settings-row__value" id="resolutionScaleValue">0.75×</span>
+            </div>
+            <input type="range" class="gd-slider" id="resolutionScaleSlider" min="0.5" max="1.5" step="0.05" value="0.75">
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <span>Radio de calles cargadas</span>
+              <span class="settings-row__value" id="roadTileMarginValue">3×3 tiles</span>
+            </div>
+            <input type="range" class="gd-slider" id="roadTileMarginSlider" min="0" max="2" step="1" value="1">
+          </div>
+
+          <div class="settings-row">
+            <button class="settings-panel__reset" id="lowestSettingsBtn" type="button">Rendimiento máximo (mínimos)</button>
           </div>
 
         </div>
