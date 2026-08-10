@@ -241,6 +241,7 @@ let tileset = null; // referencia global al 3D Tileset, usada por el panel de Co
    El globo se crea de forma perezosa (lazy) la primera vez que se activa
    World Terrain, ya que el viewer arranca con globe:false. */
 let worldTerrainProvider = null;
+let worldImageryLayer = null;
 let isWorldTerrainLoading = false;
 let usingWorldTerrain = false;
 
@@ -267,6 +268,15 @@ async function toggleTilesTerrain() {
       viewer.terrainProvider = worldTerrainProvider;
       if (tileset) tileset.show = false;
 
+      // Sin capa de imagería el globo se ve gris/plano (solo baseColor).
+      // Se agrega imagería satelital (Bing/Ion World Imagery) una sola vez.
+      if (!worldImageryLayer) {
+        const worldImageryProvider = await Cesium.createWorldImageryAsync();
+        worldImageryLayer = viewer.scene.imageryLayers.addImageryProvider(worldImageryProvider);
+      } else {
+        worldImageryLayer.show = true;
+      }
+
       usingWorldTerrain = true;
       if (btn) {
         btn.classList.add("is-terrain");
@@ -284,6 +294,7 @@ async function toggleTilesTerrain() {
     // Volver A Google Photorealistic 3D Tiles
     if (viewer.scene.globe) viewer.scene.globe.show = false;
     viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+    if (worldImageryLayer) worldImageryLayer.show = false;
     if (tileset) tileset.show = true;
 
     usingWorldTerrain = false;
