@@ -235,6 +235,67 @@ let viewer = null;
 let simInitialized = false;
 let tileset = null; // referencia global al 3D Tileset, usada por el panel de Configuración
 
+/* ============ TOGGLE: GOOGLE 3D TILES ↔ WORLD TERRAIN ============
+   Alterna entre los 3D Tiles fotorrealistas de Google (tileset, por
+   defecto) y el Cesium World Terrain (globo con relieve, sin fotorrealismo).
+   El globo se crea de forma perezosa (lazy) la primera vez que se activa
+   World Terrain, ya que el viewer arranca con globe:false. */
+let worldTerrainProvider = null;
+let isWorldTerrainLoading = false;
+let usingWorldTerrain = false;
+
+async function toggleTilesTerrain() {
+  if (!viewer || isWorldTerrainLoading) return;
+  const btn = document.getElementById("tilesTerrainToggleBtn");
+
+  if (!usingWorldTerrain) {
+    // Cambiar A World Terrain
+    try {
+      isWorldTerrainLoading = true;
+      if (btn) { btn.textContent = "⏳"; btn.disabled = true; }
+
+      if (!worldTerrainProvider) {
+        worldTerrainProvider = await Cesium.createWorldTerrainAsync({
+          requestVertexNormals: true,
+        });
+      }
+      if (!viewer.scene.globe) {
+        viewer.scene.globe = new Cesium.Globe(Cesium.Ellipsoid.WGS84);
+        viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#3a3a30");
+      }
+      viewer.scene.globe.show = true;
+      viewer.terrainProvider = worldTerrainProvider;
+      if (tileset) tileset.show = false;
+
+      usingWorldTerrain = true;
+      if (btn) {
+        btn.classList.add("is-terrain");
+        btn.textContent = "🗺️";
+        btn.title = "Cambiar a Google 3D Tiles";
+        btn.setAttribute("aria-label", "Cambiar a Google 3D Tiles");
+      }
+    } catch (error) {
+      console.error("No se pudo cargar World Terrain:", error);
+    } finally {
+      isWorldTerrainLoading = false;
+      if (btn) btn.disabled = false;
+    }
+  } else {
+    // Volver A Google Photorealistic 3D Tiles
+    if (viewer.scene.globe) viewer.scene.globe.show = false;
+    viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+    if (tileset) tileset.show = true;
+
+    usingWorldTerrain = false;
+    if (btn) {
+      btn.classList.remove("is-terrain");
+      btn.textContent = "🌐";
+      btn.title = "Cambiar a World Terrain";
+      btn.setAttribute("aria-label", "Cambiar a World Terrain");
+    }
+  }
+}
+
 /* ============ CONFIGURACIÓN / OPTIMIZACIÓN (heredado de GeoDrive) ============
    Mismos mecanismos que usa GeoDrive para su sistema de calidad/rendimiento
    de Google Photorealistic 3D Tiles (maximumScreenSpaceError, culling del
@@ -1402,6 +1463,11 @@ function closeSettings(){
 }
 
 settingsBtn.addEventListener("click", openSettings);
+
+const tilesTerrainToggleBtn = document.getElementById("tilesTerrainToggleBtn");
+if (tilesTerrainToggleBtn) {
+  tilesTerrainToggleBtn.addEventListener("click", toggleTilesTerrain);
+}
 settingsCloseBtn.addEventListener("click", closeSettings);
 settingsOverlay.addEventListener("click", (e) => {
   if (e.target === settingsOverlay) closeSettings();

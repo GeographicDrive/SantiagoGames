@@ -365,6 +365,11 @@ body{
   transform:scale(0.94);
 }
 
+.icon-btn--toggle.is-terrain{
+  background:var(--line);
+  color:var(--bg);
+}
+
 /* ============ PANEL DE CONFIGURACIÓN ============ */
 
 .settings-overlay{
