@@ -902,8 +902,10 @@ const carState = { lat: SPAWN_LAT, lng: SPAWN_LON, heading: SPAWN_HEADING_DEG, s
 
 // Input activo: gas/freno/izquierda/derecha, seteado por teclado y por los
 // botones táctiles (D-pad + pedales) — ambos escriben al mismo objeto, así
-// que funcionan indistintamente o combinados.
-const driveInput = { forward: false, back: false, left: false, right: false };
+// que funcionan indistintamente o combinados. "jump" es el botón de
+// salto/aleteo (mantenido); "flyToggle" es un botón de un solo disparo
+// para entrar/salir del modo volador (DeLorean), no un input continuo.
+const driveInput = { forward: false, back: false, left: false, right: false, jump: false };
 
 let carAnimFrameId = null;
 let carLastFrameTime = null;
@@ -923,6 +925,8 @@ function bindDriveKey(key, prop){
 ["ArrowDown", "s", "S"].forEach((k) => bindDriveKey(k, "back"));
 ["ArrowLeft", "a", "A"].forEach((k) => bindDriveKey(k, "left"));
 ["ArrowRight", "d", "D"].forEach((k) => bindDriveKey(k, "right"));
+bindDriveKey(" ", "jump"); // barra espaciadora = salto/aleteo (mantenida en modo volador = ascender)
+window.addEventListener("keydown", (e) => { if (e.key === " ") e.preventDefault(); }); // evita scroll de página
 
 function bindDriveButton(el, prop){
   if (!el) return;
@@ -937,8 +941,110 @@ bindDriveButton(document.getElementById("btnGas"), "forward");
 bindDriveButton(document.getElementById("btnBrake"), "back");
 bindDriveButton(document.getElementById("btnLeft"), "left");
 bindDriveButton(document.getElementById("btnRight"), "right");
+bindDriveButton(document.getElementById("btnJump"), "jump");
+
+/* ---- Modo volador (DeLorean) ----
+ * Botón de un solo disparo (no mantenido): alterna entre manejar por el
+ * suelo (con colisión 3D + contacto de terreno + repulsión de calles,
+ * todo como siempre) y volar libremente (sin esas tres restricciones,
+ * el auto puede pasar por encima de edificios y fuera de las calles).
+ * El botón de salto pasa a controlar el ascenso/descenso mientras se
+ * mantiene presionado, en vez de dar un impulso puntual. */
+let flyMode = false;
+function setFlyMode(next){
+  flyMode = next;
+  const btn = document.getElementById("btnFly");
+  if (btn){
+    btn.classList.toggle("is-active", flyMode);
+    btn.textContent = flyMode ? "TIERRA" : "VOLAR";
+    btn.title = flyMode ? "Volver a manejar por el suelo" : "Convertirse en auto volador (DeLorean)";
+  }
+  VehicleCollision3D.reset();
+  updateRepulsionDebugState(null); // limpia el HUD de repulsión: no aplica mientras se vuela
+}
+const flyToggleBtn = document.getElementById("btnFly");
+if (flyToggleBtn){
+  flyToggleBtn.addEventListener("click", (e) => { e.preventDefault(); setFlyMode(!flyMode); });
+}
+window.addEventListener("keydown", (e) => {
+  if (e.key === "f" || e.key === "F") setFlyMode(!flyMode);
+});
 
 const speedValueEl = document.getElementById("speedValue");
+
+/**
+ * VerticalPhysics — altura AGREGADA sobre el contacto de suelo normal
+ * (GroundContact), completamente separada de él: GroundContact sigue
+ * calculando dónde está el suelo/pendiente como siempre, y esto solo
+ * suma un offset vertical encima para el salto/aleteo y el vuelo.
+ *
+ *   - Modo normal (flyMode=false): cada pulsación del botón de salto da
+ *     un impulso vertical fijo hacia arriba (estilo "flappy bird": no
+ *     hace falta estar apoyado en el suelo para volver a aletear), la
+ *     gravedad tira hacia abajo todo el tiempo, y el offset nunca baja
+ *     de 0 (ahí "aterriza" sobre el contacto de suelo normal).
+ *   - Modo volador (flyMode=true, botón "VOLAR"/DeLorean): mantener
+ *     presionado el botón de salto da empuje continuo hacia arriba
+ *     (ascender); soltarlo hace que descienda suave (planeo, no caída
+ *     libre) en vez de gravedad completa. Con esto el mismo botón sirve
+ *     para "aletear" en el suelo y para "acelerar hacia arriba" volando,
+ *     sin necesitar un tercer botón.
+ */
+const VerticalPhysics = (() => {
+  const JUMP_IMPULSE_MPS = 6.5;       // impulso vertical al aletear (modo normal)
+  const GRAVITY_MPS2 = 15;            // caída arcade tipo flappy (más rápida que 9.8 real)
+  const FLY_THRUST_MPS2 = 22;         // aceleración ascendente mientras se mantiene el botón, en vuelo
+  const FLY_GLIDE_GRAVITY_MPS2 = 5;   // caída suave (planeo) al soltar el botón, en vuelo
+  const FLY_MAX_ALTITUDE_M = 180;     // techo de vuelo sobre el terreno
+  const GROUND_EPS_M = 0.02;
+
+  let verticalOffset = 0; // metros sobre GroundContact.getHeight()
+  let verticalVelocity = 0;
+  let prevJumpHeld = false;
+
+  function update(dt){
+    const jumpEdge = driveInput.jump && !prevJumpHeld; // flanco de subida: se acaba de presionar
+    prevJumpHeld = driveInput.jump;
+
+    if (flyMode){
+      if (driveInput.jump){
+        verticalVelocity += FLY_THRUST_MPS2 * dt;
+      } else if (verticalVelocity > -FLY_GLIDE_GRAVITY_MPS2 * 3){
+        verticalVelocity -= FLY_GLIDE_GRAVITY_MPS2 * dt; // planeo, no caída libre
+      }
+      verticalOffset += verticalVelocity * dt;
+      if (verticalOffset > FLY_MAX_ALTITUDE_M){
+        verticalOffset = FLY_MAX_ALTITUDE_M;
+        if (verticalVelocity > 0) verticalVelocity = 0;
+      } else if (verticalOffset < 0){
+        verticalOffset = 0;
+        if (verticalVelocity < 0) verticalVelocity = 0;
+      }
+    } else {
+      // Estilo flappy bird: cada pulsación RE-establece la velocidad
+      // vertical al impulso fijo (no se acumula), así cada aleteo sube
+      // siempre lo mismo sin importar qué tan rápido se esté cayendo.
+      if (jumpEdge) verticalVelocity = JUMP_IMPULSE_MPS;
+      verticalVelocity -= GRAVITY_MPS2 * dt;
+      verticalOffset += verticalVelocity * dt;
+      if (verticalOffset <= GROUND_EPS_M){
+        verticalOffset = 0;
+        verticalVelocity = 0; // aterrizó sobre el contacto de suelo normal
+      }
+    }
+  }
+
+  function getOffset(){ return verticalOffset; }
+  function isAirborne(){ return verticalOffset > GROUND_EPS_M; }
+
+  function reset(){
+    verticalOffset = 0;
+    verticalVelocity = 0;
+    prevJumpHeld = false;
+  }
+
+  return { update, getOffset, isAirborne, reset };
+})();
 
 /**
  * updateCarPhysics — igual fórmula que GeoDrive para vehículos terrestres:
@@ -970,7 +1076,11 @@ function updateCarPhysics(dt){
   // movimiento que se acaba de calcular arriba si atraviesa un obstáculo.
   // Separado a propósito de GroundContact (altura de suelo) y de
   // updateStreetRepulsion (calles OSM), que corren después en el loop.
-  VehicleCollision3D.resolveMovement(prevLat, prevLng, GroundContact.getHeight());
+  // En modo volador (DeLorean) se omite a propósito: volar por encima de
+  // los edificios es justamente el punto de ese modo.
+  if (!flyMode){
+    VehicleCollision3D.resolveMovement(prevLat, prevLng, GroundContact.getHeight());
+  }
 }
 
 /**
@@ -988,13 +1098,17 @@ function updateCarEntityAndCamera(dt){
   // terreno confirmado tras un pico) se ve como una transición fluida y
   // no como un salto brusco.
   GroundContact.update(dt);
-  const groundHeight = GroundContact.getHeight();
+  VerticalPhysics.update(dt);
+  const airborne = VerticalPhysics.isAirborne() || flyMode;
+  const groundHeight = GroundContact.getHeight() + VerticalPhysics.getOffset();
   const carPosition = Cesium.Cartesian3.fromDegrees(carState.lng, carState.lat, groundHeight);
   _tmpHprModel.heading = Cesium.Math.toRadians(carState.heading + MODEL_HEADING_OFFSET_DEG);
   // Pitch/roll siguen la pendiente/inclinación real del terreno bajo el
-  // auto (ver GroundContact), en vez de ir siempre plano.
-  _tmpHprModel.pitch = GroundContact.getPitch();
-  _tmpHprModel.roll = GroundContact.getRoll();
+  // auto (ver GroundContact) SOLO cuando está apoyado; en el aire (salto
+  // o modo volador) no tiene sentido inclinarse contra un suelo que ya
+  // no está tocando, así que se nivela.
+  _tmpHprModel.pitch = airborne ? 0 : GroundContact.getPitch();
+  _tmpHprModel.roll = airborne ? 0 : GroundContact.getRoll();
   audiEntity.position = carPosition;
   audiEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(carPosition, _tmpHprModel);
 
@@ -1281,7 +1395,7 @@ const GroundContact = (() => {
  * 2) VehicleCollision3D — colisión física del vehículo contra geometría
  *    3D (edificios/objetos de los 3D Tiles u otros primitives). Antes no
  *    existía ningún chequeo de este tipo: el auto podía atravesar
- *    edificios libremente. Usa scene.pickFromRay (intersección real
+ *    edificios libremente. Usa scene.drillPickFromRay (intersección real
  *    contra la geometría, no contra el framebuffer) sobre la trayectoria
  *    que el auto está a punto de recorrer este frame, y si detecta un
  *    obstáculo más cerca que la distancia a mover, recorta el movimiento
@@ -1324,8 +1438,24 @@ const VehicleCollision3D = (() => {
    * carState.speed. No toca nada relacionado con altura de terreno ni
    * con calles: solo bloquea/permite el desplazamiento horizontal.
    */
+  // Altura mínima que debe tener un impacto POR ENCIMA del suelo esperado
+  // para contar como obstáculo real (pared/edificio). Sin este filtro, el
+  // rayo casi horizontal a PROBE_HEIGHT_M roza la propia malla de la
+  // calle (los 3D Tiles fotorrealistas no son perfectamente planos) y
+  // "impacta" a ~0m en CADA frame, bloqueando el auto por completo. Un
+  // bordillo normal ronda ~0.15m; con 0.35m se ignoran esos roces del
+  // piso pero se sigue detectando cualquier pared/objeto real.
+  const OBSTACLE_MIN_HEIGHT_ABOVE_GROUND_M = 0.35;
+  // Máximo de impactos a inspeccionar por rayo (drillPick): con los
+  // primeros 2-3 alcanza para saltar impactos rasantes del piso y llegar
+  // al primer obstáculo vertical real, sin acercarse al costo de un
+  // drillPick sin límite.
+  const MAX_DRILL_HITS = 4;
+
+  const _hitCarto = new Cesium.Cartographic();
+
   function resolveMovement(prevLat, prevLng, groundHeightHint){
-    if (!viewer || !viewer.scene || typeof viewer.scene.pickFromRay !== "function") return;
+    if (!viewer || !viewer.scene || typeof viewer.scene.drillPickFromRay !== "function") return;
 
     const prevXY = lonLatToLocalXY(prevLng, prevLat);
     const curXY = lonLatToLocalXY(carState.lng, carState.lat);
@@ -1337,7 +1467,7 @@ const VehicleCollision3D = (() => {
 
     // Throttle: si el auto casi no se movió desde el último chequeo Y la
     // dirección es prácticamente la misma, reutiliza el resultado
-    // anterior en vez de volver a llamar a pickFromRay.
+    // anterior en vez de volver a llamar al raycast.
     if (lastCheckX !== null){
       const sinceLast = Math.hypot(curXY.x - lastCheckX, curXY.y - lastCheckY);
       if (sinceLast < MIN_RECHECK_MOVE_M && lastBlockedDist < Infinity){
@@ -1347,7 +1477,8 @@ const VehicleCollision3D = (() => {
     }
 
     const probeDist = Math.max(MIN_PROBE_M, moveDist + SKIN_MARGIN_M);
-    const baseHeight = (groundHeightHint ?? 0) + PROBE_HEIGHT_M;
+    const baseGround = groundHeightHint ?? 0;
+    const baseHeight = baseGround + PROBE_HEIGHT_M;
 
     const originLL = { lon: prevLng, lat: prevLat };
     const targetLocal = { x: prevXY.x + dirX * probeDist, y: prevXY.y + dirY * probeDist };
@@ -1362,16 +1493,36 @@ const VehicleCollision3D = (() => {
     _ray.origin = _origin;
     _ray.direction = _dir;
 
-    let result = null;
+    let results = null;
     try {
-      result = viewer.scene.pickFromRay(_ray, audiEntity ? [audiEntity] : []);
-    } catch (e) { result = null; } // p.ej. tileset todavía sin cargar cerca: sin bloqueo este frame
+      // drillPick (no pick simple): un solo hit no alcanza porque el
+      // primero suele ser el propio piso/calle a distancia casi 0; se
+      // necesitan varios para descartar esos roces y encontrar, si
+      // existe, el primer impacto que sea realmente más alto que el
+      // suelo (pared/edificio).
+      results = viewer.scene.drillPickFromRay(_ray, MAX_DRILL_HITS, audiEntity ? [audiEntity] : []);
+    } catch (e) { results = null; } // p.ej. tileset todavía sin cargar cerca: sin bloqueo este frame
 
     lastCheckX = curXY.x; lastCheckY = curXY.y;
 
-    if (result && result.position){
-      const hitDist = Cesium.Cartesian3.distance(_origin, result.position);
-      lastBlockedDist = Math.max(0, hitDist - SKIN_MARGIN_M);
+    let obstacleDist = Infinity;
+    if (results && results.length){
+      for (let i = 0; i < results.length; i++){
+        const pos = results[i] && results[i].position;
+        if (!pos) continue;
+        Cesium.Cartographic.fromCartesian(pos, Cesium.Ellipsoid.WGS84, _hitCarto);
+        const heightAboveGround = _hitCarto.height - baseGround;
+        if (heightAboveGround >= OBSTACLE_MIN_HEIGHT_ABOVE_GROUND_M){
+          obstacleDist = Cesium.Cartesian3.distance(_origin, pos);
+          break; // el más cercano que califica como obstáculo real
+        }
+        // si no califica (roce de piso/bordillo bajo), se sigue con el
+        // próximo impacto más lejano del mismo rayo
+      }
+    }
+
+    if (obstacleDist < Infinity){
+      lastBlockedDist = Math.max(0, obstacleDist - SKIN_MARGIN_M);
       applyClamp(prevXY, dirX, dirY, moveDist, lastBlockedDist);
     } else {
       lastBlockedDist = Infinity; // camino libre por delante del probe
@@ -1411,7 +1562,10 @@ function carAnimationLoop(timestampMs){
 
   const _tPhysicsStart = Profiler.enabled ? performance.now() : 0;
   updateCarPhysics(dt);
-  updateStreetRepulsion(dt);
+  // Repulsión hacia calles OSM/Overpass: solo aplica manejando por el
+  // suelo. En modo volador (DeLorean) el auto puede estar sobre
+  // cualquier punto, no solo calles, así que se omite a propósito.
+  if (!flyMode) updateStreetRepulsion(dt);
   updateFreeLookIdle(dt);
   const _tCamStart = Profiler.enabled ? performance.now() : 0;
   updateCarEntityAndCamera(dt);
@@ -1486,6 +1640,8 @@ async function spawnAudiQuattro(){
   }
   GroundContact.reset(groundHeight); // sin suavizado en el spawn: aparece directo en su altura
   VehicleCollision3D.reset();
+  VerticalPhysics.reset();
+  setFlyMode(false);
 
   carState.lat = SPAWN_LAT;
   carState.lng = SPAWN_LON;
