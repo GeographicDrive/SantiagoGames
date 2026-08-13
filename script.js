@@ -961,9 +961,16 @@ function updateCarPhysics(dt){
   }
   carState.heading = (carState.heading + 360) % 360;
 
+  const prevLat = carState.lat, prevLng = carState.lng;
   const hdgRad = Cesium.Math.toRadians(carState.heading);
   carState.lat += (carState.speed / 3.6 * Math.cos(hdgRad)) / 111320 * dt;
   carState.lng += (carState.speed / 3.6 * Math.sin(hdgRad)) / (111320 * Math.cos(Cesium.Math.toRadians(carState.lat))) * dt;
+
+  // Colisión física contra geometría 3D (edificios/objetos): recorta el
+  // movimiento que se acaba de calcular arriba si atraviesa un obstáculo.
+  // Separado a propósito de GroundContact (altura de suelo) y de
+  // updateStreetRepulsion (calles OSM), que corren después en el loop.
+  VehicleCollision3D.resolveMovement(prevLat, prevLng, GroundContact.getHeight());
 }
 
 /**
@@ -976,22 +983,18 @@ function updateCarPhysics(dt){
 function updateCarEntityAndCamera(dt){
   if (!audiEntity || !viewer) return;
 
-  // No se aplica _lastCarGroundHeight (el target validado) directo: se
-  // desliza _displayedGroundHeight hacia él con suavizado exponencial, así
-  // incluso un cambio real y grande (p.ej. terreno confirmado tras un
-  // pico) se ve como una transición fluida y no como un salto brusco.
-  const targetGroundHeight = _lastCarGroundHeight ?? 0;
-  if (_displayedGroundHeight === null){
-    _displayedGroundHeight = targetGroundHeight;
-  } else {
-    const heightAlpha = 1.0 - Math.exp(-GROUND_HEIGHT_SMOOTH_RATE * dt);
-    _displayedGroundHeight += (targetGroundHeight - _displayedGroundHeight) * heightAlpha;
-  }
-  const groundHeight = _displayedGroundHeight;
+  // GroundContact no aplica la altura validada directo: la desliza con
+  // suavizado exponencial, así incluso un cambio real y grande (p.ej.
+  // terreno confirmado tras un pico) se ve como una transición fluida y
+  // no como un salto brusco.
+  GroundContact.update(dt);
+  const groundHeight = GroundContact.getHeight();
   const carPosition = Cesium.Cartesian3.fromDegrees(carState.lng, carState.lat, groundHeight);
   _tmpHprModel.heading = Cesium.Math.toRadians(carState.heading + MODEL_HEADING_OFFSET_DEG);
-  _tmpHprModel.pitch = 0;
-  _tmpHprModel.roll = 0;
+  // Pitch/roll siguen la pendiente/inclinación real del terreno bajo el
+  // auto (ver GroundContact), en vez de ir siempre plano.
+  _tmpHprModel.pitch = GroundContact.getPitch();
+  _tmpHprModel.roll = GroundContact.getRoll();
   audiEntity.position = carPosition;
   audiEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(carPosition, _tmpHprModel);
 
@@ -1106,80 +1109,300 @@ const _tmpEnuFrame = new Cesium.Matrix4();
 // valor de configuración no cambió desde el frame anterior.
 let _lastAppliedFovDeg = null;
 
-let _lastCarGroundHeight = null;   // última altura de terreno VALIDADA (target)
-let _pendingSpikeHeight = null;    // lectura atípica en espera de confirmación
-let _displayedGroundHeight = null; // altura realmente aplicada al auto (suavizada frame a frame)
-let _carGroundSampleInFlight = false;
-
-// Umbral de salto máximo verosímil entre dos muestreos consecutivos de
-// altura (cada CAR_GROUND_SAMPLE_INTERVAL_MS). Los 3D Tiles a veces
-// devuelven lecturas erráticas (p.ej. un pico de cientos de metros por un
-// glitch de LOD/raycast) que no corresponden a ningún cambio real de
-// terreno. 500→501→850→503 es exactamente ese caso: 850 se descarta.
-// 20m en 400ms equivale a ~50m/s de velocidad vertical, muy por encima de
-// cualquier rampa o pendiente real — suficiente margen para no rechazar
-// subidas/bajadas legítimas (500→502→505→510) pero sí un salto absurdo.
-const CAR_GROUND_SAMPLE_INTERVAL_MS = 400;
-const MAX_PLAUSIBLE_GROUND_JUMP_M = 20;
-// Velocidad (en "unidades de suavizado exponencial") a la que el auto se
-// desliza hacia la altura validada, en vez de teletransportarse a ella.
-const GROUND_HEIGHT_SMOOTH_RATE = 6;
-
-/**
- * sampleCarGroundHeight — re-muestrea la altura real del terreno bajo el
- * auto de forma periódica (no cada frame, es una llamada relativamente
- * cara) para que el auto se mantenga apoyado en el suelo/rampas mientras
- * se conduce, igual que hace GeoDrive con su plano de referencia.
+/* =====================================================================
+ * SISTEMA DE COLISIÓN — reemplazo de "sampleCarGroundHeight"
+ * =====================================================================
+ * El sistema viejo hacía UNA sola cosa (muestrear altura de terreno) y la
+ * usaba para dos propósitos distintos a la vez: apoyar el auto en el
+ * suelo Y (indirectamente, nunca) evitar que atravesara geometría 3D. No
+ * había ninguna detección real de obstáculos: el auto podía atravesar
+ * edificios sin más. Se separa ahora en tres módulos independientes, cada
+ * uno con una sola responsabilidad, tal como pide la tarea:
  *
- * No se confía ciegamente en cada lectura: se compara contra la última
- * altura válida y, si el salto es implausible, se descarta como posible
- * error de los 3D Tiles (ver MAX_PLAUSIBLE_GROUND_JUMP_M). Si la misma
- * lectura atípica se repite en el ciclo siguiente, se asume que es un
- * cambio real de terreno (p.ej. el auto subió a un puente/rampa abrupta)
- * y se acepta, para no quedar "trabado" si el pico no era un error.
- */
-async function sampleCarGroundHeight(){
-  if (_carGroundSampleInFlight || !viewer) return;
-  _carGroundSampleInFlight = true;
-  try {
-    const carto = Cesium.Cartographic.fromDegrees(carState.lng, carState.lat);
-    // Se excluye al propio audiEntity del muestreo: sin esto, cada 400ms el
-    // rayo podía "pisar" el techo del propio modelo del auto en vez del
-    // suelo real, y como la altura resultante se usa para reposicionar el
-    // auto, el error se iba acumulando ciclo a ciclo — el auto quedaba
-    // subiendo solo de a poco mientras estaba detenido (o incluso andando).
-    const excluded = audiEntity ? [audiEntity] : [];
-    const sampled = await sampleHeightMostDetailedSafe(carto ? [carto] : [], undefined, excluded);
-    if (sampled && sampled[0] && isFinite(sampled[0].height)){
+ *   1) GroundContact      — SOLO contacto con el suelo/terreno (altura +
+ *                           pendiente/inclinación bajo el auto). Es la
+ *                           evolución directa de sampleCarGroundHeight:
+ *                           mismo muestreo periódico (no por frame),
+ *                           mismo rechazo de picos implausibles y mismo
+ *                           suavizado exponencial, pero además calcula
+ *                           pitch/roll para que el auto seed la pendiente
+ *                           real en vez de ir siempre plano.
+ *   2) VehicleCollision3D — SOLO colisión física contra geometría 3D
+ *                           (edificios/objetos de los 3D Tiles u otros
+ *                           primitives de la escena). Antes no existía:
+ *                           ahora el auto no puede atravesar geometría
+ *                           sólida, y responde de forma estable (frena/
+ *                           desliza en vez de trabarse en seco).
+ *   3) updateStreetRepulsion — YA EXISTÍA (más abajo, sin tocar): sigue
+ *                           siendo el único responsable de la corrección
+ *                           hacia calles OSM/Overpass. No se duplica ni
+ *                           se mezcla con los dos módulos de arriba.
+ *
+ * carAnimationLoop llama a los tres en orden (física → colisión 3D →
+ * repulsión de calles → contacto de suelo), cada uno tocando solo su
+ * propia porción de carState/altura, sin pisarse entre sí.
+ * ===================================================================== */
+
+/* ---------------------------------------------------------------------
+ * 1) GroundContact — contacto con el suelo/terreno (altura + pendiente)
+ * --------------------------------------------------------------------- */
+const GroundContact = (() => {
+  // Mismo intervalo/umbral/tasa de suavizado que tenía sampleCarGroundHeight
+  // originalmente — no se reinventa la calibración, solo se reorganiza.
+  const SAMPLE_INTERVAL_MS = 400;
+  const MAX_PLAUSIBLE_JUMP_M = 20;
+  const HEIGHT_SMOOTH_RATE = 6;
+  // Distancia (m) desde el centro del auto a la que se muestrea adelante/
+  // al costado para estimar pendiente (pitch) e inclinación lateral
+  // (roll). Aproxima el semi-largo/semi-ancho del Audi Quattro; no hace
+  // falta que sea exacto, solo lo bastante separado para que la
+  // diferencia de altura entre puntos no sea puro ruido de los 3D Tiles.
+  const SLOPE_PROBE_FWD_M = 1.8;
+  const SLOPE_PROBE_SIDE_M = 0.85;
+  // Pendiente máxima verosímil (~45°): por encima de esto se asume error
+  // de muestreo puntual (borde de tile, glitch) y se ignora ese frame de
+  // pitch/roll, conservando el último valor válido.
+  const MAX_PLAUSIBLE_SLOPE_RAD = Cesium.Math.toRadians(45);
+  const SLOPE_SMOOTH_RATE = 5;
+
+  let lastValidHeight = null;     // última altura de terreno VALIDADA (target)
+  let pendingSpikeHeight = null;  // lectura atípica en espera de confirmación
+  let displayedHeight = null;     // altura aplicada al auto (suavizada frame a frame)
+  let targetPitchRad = 0;
+  let targetRollRad = 0;
+  let displayedPitchRad = 0;
+  let displayedRollRad = 0;
+  let sampleInFlight = false;
+  let timerId = null;
+
+  // Cartographic reutilizados entre muestreos: sampleHeightMostDetailed
+  // acepta un array y no necesita objetos nuevos cada 400ms.
+  const _cartoCenter = new Cesium.Cartographic();
+  const _cartoFwd = new Cesium.Cartographic();
+  const _cartoSide = new Cesium.Cartographic();
+  const _sampleBatch = [_cartoCenter, _cartoFwd, _cartoSide];
+
+  async function sample(){
+    if (sampleInFlight || !viewer) return;
+    sampleInFlight = true;
+    try {
+      const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
+      const hdgRad = Cesium.Math.toRadians(carState.heading);
+      const fwdX = Math.sin(hdgRad), fwdY = Math.cos(hdgRad);
+      const rightX = fwdY, rightY = -fwdX; // perpendicular a la derecha del heading
+
+      Cesium.Cartographic.fromDegrees(carState.lng, carState.lat, 0, _cartoCenter);
+      const fwdLL = localXYToLonLat(carX + fwdX * SLOPE_PROBE_FWD_M, carY + fwdY * SLOPE_PROBE_FWD_M);
+      Cesium.Cartographic.fromDegrees(fwdLL.lon, fwdLL.lat, 0, _cartoFwd);
+      const sideLL = localXYToLonLat(carX + rightX * SLOPE_PROBE_SIDE_M, carY + rightY * SLOPE_PROBE_SIDE_M);
+      Cesium.Cartographic.fromDegrees(sideLL.lon, sideLL.lat, 0, _cartoSide);
+
+      // Un solo batch (3 puntos) por ciclo, no 3 llamadas separadas: evita
+      // triplicar las consultas a los 3D Tiles cada 400ms.
+      const excluded = audiEntity ? [audiEntity] : [];
+      const sampled = await sampleHeightMostDetailedSafe(_sampleBatch, undefined, excluded);
+      if (!sampled || !sampled[0] || !isFinite(sampled[0].height)){ sampleInFlight = false; return; }
+
       const newHeight = sampled[0].height;
-      if (_lastCarGroundHeight === null){
-        // Primera lectura: no hay referencia previa contra la cual validar.
-        _lastCarGroundHeight = newHeight;
-        _pendingSpikeHeight = null;
+      if (lastValidHeight === null){
+        lastValidHeight = newHeight;
+        pendingSpikeHeight = null;
       } else {
-        const jump = Math.abs(newHeight - _lastCarGroundHeight);
-        if (jump <= MAX_PLAUSIBLE_GROUND_JUMP_M){
-          // Cambio dentro de lo esperable (incluye subidas/bajadas reales).
-          _lastCarGroundHeight = newHeight;
-          _pendingSpikeHeight = null;
-        } else if (_pendingSpikeHeight !== null &&
-                   Math.abs(newHeight - _pendingSpikeHeight) <= MAX_PLAUSIBLE_GROUND_JUMP_M){
-          // La lectura atípica se repitió: se confirma como cambio real.
-          _lastCarGroundHeight = newHeight;
-          _pendingSpikeHeight = null;
+        const jump = Math.abs(newHeight - lastValidHeight);
+        if (jump <= MAX_PLAUSIBLE_JUMP_M){
+          lastValidHeight = newHeight;
+          pendingSpikeHeight = null;
+        } else if (pendingSpikeHeight !== null &&
+                   Math.abs(newHeight - pendingSpikeHeight) <= MAX_PLAUSIBLE_JUMP_M){
+          // La lectura atípica se repitió: se confirma como cambio real
+          // (p.ej. el auto subió a un puente/rampa abrupta).
+          lastValidHeight = newHeight;
+          pendingSpikeHeight = null;
         } else {
-          // Pico aislado: se descarta y se conserva la última altura válida.
           console.warn(
-            `Lectura de altura del terreno descartada (salto de ${jump.toFixed(1)}m): ` +
-            `${newHeight.toFixed(1)}m vs última válida ${_lastCarGroundHeight.toFixed(1)}m.`
+            `GroundContact: lectura de altura descartada (salto de ${jump.toFixed(1)}m): ` +
+            `${newHeight.toFixed(1)}m vs última válida ${lastValidHeight.toFixed(1)}m.`
           );
-          _pendingSpikeHeight = newHeight;
+          pendingSpikeHeight = newHeight;
         }
       }
+
+      // Pendiente/inclinación: solo si las 3 muestras vinieron bien y no
+      // superan el máximo verosímil (protege contra bordes de tile).
+      if (sampled[1] && isFinite(sampled[1].height) && sampled[2] && isFinite(sampled[2].height) && lastValidHeight !== null){
+        const pitch = Math.atan2(sampled[1].height - lastValidHeight, SLOPE_PROBE_FWD_M);
+        const roll = Math.atan2(lastValidHeight - sampled[2].height, SLOPE_PROBE_SIDE_M);
+        if (Math.abs(pitch) <= MAX_PLAUSIBLE_SLOPE_RAD) targetPitchRad = pitch;
+        if (Math.abs(roll) <= MAX_PLAUSIBLE_SLOPE_RAD) targetRollRad = roll;
+      }
+    } catch (e) { /* sin conexión momentánea, se reintenta en el próximo ciclo */ }
+    sampleInFlight = false;
+  }
+
+  // Avanza el suavizado exponencial de altura/pitch/roll. Se llama una
+  // vez por frame (barato: solo aritmética, sin consultas), separado del
+  // muestreo caro (sample(), que corre por su propio setInterval).
+  function update(dt){
+    const targetHeight = lastValidHeight ?? 0;
+    if (displayedHeight === null){
+      displayedHeight = targetHeight;
+    } else {
+      const alpha = 1.0 - Math.exp(-HEIGHT_SMOOTH_RATE * dt);
+      displayedHeight += (targetHeight - displayedHeight) * alpha;
     }
-  } catch (e) { /* sin conexión momentánea, se reintenta en el próximo ciclo */ }
-  _carGroundSampleInFlight = false;
-}
+    const slopeAlpha = 1.0 - Math.exp(-SLOPE_SMOOTH_RATE * dt);
+    displayedPitchRad += (targetPitchRad - displayedPitchRad) * slopeAlpha;
+    displayedRollRad += (targetRollRad - displayedRollRad) * slopeAlpha;
+  }
+
+  function getHeight(){ return displayedHeight ?? 0; }
+  function getPitch(){ return displayedPitchRad; }
+  function getRoll(){ return displayedRollRad; }
+
+  function reset(height){
+    lastValidHeight = height;
+    pendingSpikeHeight = null;
+    displayedHeight = height; // sin suavizado: aparece directo en su altura (spawn)
+    targetPitchRad = 0; targetRollRad = 0;
+    displayedPitchRad = 0; displayedRollRad = 0;
+  }
+
+  function start(){
+    if (timerId === null) timerId = setInterval(sample, SAMPLE_INTERVAL_MS);
+  }
+  function stop(){
+    if (timerId !== null){ clearInterval(timerId); timerId = null; }
+  }
+
+  return { update, getHeight, getPitch, getRoll, reset, start, stop, sampleNow: sample };
+})();
+
+/* ---------------------------------------------------------------------
+ * 2) VehicleCollision3D — colisión física del vehículo contra geometría
+ *    3D (edificios/objetos de los 3D Tiles u otros primitives). Antes no
+ *    existía ningún chequeo de este tipo: el auto podía atravesar
+ *    edificios libremente. Usa scene.pickFromRay (intersección real
+ *    contra la geometría, no contra el framebuffer) sobre la trayectoria
+ *    que el auto está a punto de recorrer este frame, y si detecta un
+ *    obstáculo más cerca que la distancia a mover, recorta el movimiento
+ *    hasta justo antes del obstáculo (con un pequeño margen/"skin") y
+ *    frena la velocidad en vez de dejar que seguir empujando produzca
+ *    vibración o que el auto quede clavado en seco.
+ * --------------------------------------------------------------------- */
+const VehicleCollision3D = (() => {
+  // Altura del rayo de sondeo sobre el terreno: aprox. la mitad de la
+  // altura de un auto, para que detecte paragolpes/paredes reales y no
+  // pase por alto un bordillo bajo ni "vea" solo el techo.
+  const PROBE_HEIGHT_M = 0.6;
+  // Margen de seguridad entre el auto y el obstáculo detectado: evita que
+  // el modelo (que tiene volumen) quede exactamente tangente/clipeando
+  // contra la geometría.
+  const SKIN_MARGIN_M = 0.6;
+  // Piso del largo de sondeo: aunque el auto se mueva muy poco este
+  // frame (casi detenido), igual conviene mirar un poco más adelante
+  // para no reaccionar tarde a un obstáculo inminente al acelerar.
+  const MIN_PROBE_M = 1.2;
+  // No repetir el raycast si el auto se movió menos que esto desde el
+  // último chequeo Y sigue del mismo lado del último resultado — evita
+  // gastar un pick() por frame cuando el auto está prácticamente
+  // detenido (parado en un semáforo imaginario, menú abierto, etc).
+  const MIN_RECHECK_MOVE_M = 0.05;
+
+  let lastCheckX = null, lastCheckY = null;
+  let lastBlockedDist = Infinity;
+
+  const _origin = new Cesium.Cartesian3();
+  const _target = new Cesium.Cartesian3();
+  const _dir = new Cesium.Cartesian3();
+  const _ray = new Cesium.Ray();
+
+  /**
+   * resolveMovement — dado el movimiento que updateCarPhysics ya calculó
+   * para este frame (de prevLat/prevLng a carState.lat/lng actual),
+   * verifica si ese tramo atraviesa geometría 3D y, si es así, recorta
+   * carState.lat/lng al punto justo antes del obstáculo y amortigua
+   * carState.speed. No toca nada relacionado con altura de terreno ni
+   * con calles: solo bloquea/permite el desplazamiento horizontal.
+   */
+  function resolveMovement(prevLat, prevLng, groundHeightHint){
+    if (!viewer || !viewer.scene || typeof viewer.scene.pickFromRay !== "function") return;
+
+    const prevXY = lonLatToLocalXY(prevLng, prevLat);
+    const curXY = lonLatToLocalXY(carState.lng, carState.lat);
+    let dx = curXY.x - prevXY.x, dy = curXY.y - prevXY.y;
+    const moveDist = Math.hypot(dx, dy);
+    if (moveDist < 1e-5) { lastBlockedDist = Infinity; return; } // sin movimiento este frame: nada que chequear
+
+    const dirX = dx / moveDist, dirY = dy / moveDist;
+
+    // Throttle: si el auto casi no se movió desde el último chequeo Y la
+    // dirección es prácticamente la misma, reutiliza el resultado
+    // anterior en vez de volver a llamar a pickFromRay.
+    if (lastCheckX !== null){
+      const sinceLast = Math.hypot(curXY.x - lastCheckX, curXY.y - lastCheckY);
+      if (sinceLast < MIN_RECHECK_MOVE_M && lastBlockedDist < Infinity){
+        applyClamp(prevXY, dirX, dirY, moveDist, lastBlockedDist);
+        return;
+      }
+    }
+
+    const probeDist = Math.max(MIN_PROBE_M, moveDist + SKIN_MARGIN_M);
+    const baseHeight = (groundHeightHint ?? 0) + PROBE_HEIGHT_M;
+
+    const originLL = { lon: prevLng, lat: prevLat };
+    const targetLocal = { x: prevXY.x + dirX * probeDist, y: prevXY.y + dirY * probeDist };
+    const targetLL = localXYToLonLat(targetLocal.x, targetLocal.y);
+
+    Cesium.Cartesian3.fromDegrees(originLL.lon, originLL.lat, baseHeight, _origin);
+    Cesium.Cartesian3.fromDegrees(targetLL.lon, targetLL.lat, baseHeight, _target);
+    Cesium.Cartesian3.subtract(_target, _origin, _dir);
+    const dirLen = Cesium.Cartesian3.magnitude(_dir);
+    if (dirLen < 1e-6) { lastBlockedDist = Infinity; return; }
+    Cesium.Cartesian3.divideByScalar(_dir, dirLen, _dir);
+    _ray.origin = _origin;
+    _ray.direction = _dir;
+
+    let result = null;
+    try {
+      result = viewer.scene.pickFromRay(_ray, audiEntity ? [audiEntity] : []);
+    } catch (e) { result = null; } // p.ej. tileset todavía sin cargar cerca: sin bloqueo este frame
+
+    lastCheckX = curXY.x; lastCheckY = curXY.y;
+
+    if (result && result.position){
+      const hitDist = Cesium.Cartesian3.distance(_origin, result.position);
+      lastBlockedDist = Math.max(0, hitDist - SKIN_MARGIN_M);
+      applyClamp(prevXY, dirX, dirY, moveDist, lastBlockedDist);
+    } else {
+      lastBlockedDist = Infinity; // camino libre por delante del probe
+    }
+  }
+
+  function applyClamp(prevXY, dirX, dirY, moveDist, allowedDist){
+    if (allowedDist >= moveDist) return; // el obstáculo está más allá de donde el auto iba a llegar: sin recorte
+    const clampedDist = Math.max(0, allowedDist);
+    const newX = prevXY.x + dirX * clampedDist;
+    const newY = prevXY.y + dirY * clampedDist;
+    const clampedLL = localXYToLonLat(newX, newY);
+    carState.lat = clampedLL.lat;
+    carState.lng = clampedLL.lon;
+    // Frena en vez de dejar que el input siga empujando contra la pared:
+    // si casi no quedaba distancia libre, corta la velocidad a 0; si
+    // quedaba algo, la amortigua para una respuesta menos brusca/más
+    // estable en vez de un tope en seco.
+    if (clampedDist < 0.15){
+      carState.speed = 0;
+    } else {
+      carState.speed *= 0.4;
+    }
+  }
+
+  function reset(){
+    lastCheckX = null; lastCheckY = null; lastBlockedDist = Infinity;
+  }
+
+  return { resolveMovement, reset };
+})();
 
 function carAnimationLoop(timestampMs){
   if (carLastFrameTime === null) carLastFrameTime = timestampMs;
@@ -1221,24 +1444,19 @@ function startCarLoop(){
   if (carAnimFrameId !== null) return;
   carLastFrameTime = null;
   carAnimFrameId = requestAnimationFrame(carAnimationLoop);
-  if (_carGroundSampleTimerId === null){
-    _carGroundSampleTimerId = setInterval(sampleCarGroundHeight, CAR_GROUND_SAMPLE_INTERVAL_MS);
-  }
+  GroundContact.start();
+  VehicleCollision3D.reset();
   if (_navMapTimerId === null){
     _navMapTimerId = setInterval(updateNavMap, NAV_MAP_UPDATE_INTERVAL_MS);
   }
 }
-let _carGroundSampleTimerId = null;
 
 function stopCarLoop(){
   if (carAnimFrameId !== null){
     cancelAnimationFrame(carAnimFrameId);
     carAnimFrameId = null;
   }
-  if (_carGroundSampleTimerId !== null){
-    clearInterval(_carGroundSampleTimerId);
-    _carGroundSampleTimerId = null;
-  }
+  GroundContact.stop();
   if (_navMapTimerId !== null){
     clearInterval(_navMapTimerId);
     _navMapTimerId = null;
@@ -1266,9 +1484,8 @@ async function spawnAudiQuattro(){
   } else {
     console.warn("No se pudo muestrear la altura del terreno en el spawn, usando 0.");
   }
-  _lastCarGroundHeight = groundHeight;
-  _pendingSpikeHeight = null;
-  _displayedGroundHeight = groundHeight; // sin suavizado en el spawn: aparece directo en su altura
+  GroundContact.reset(groundHeight); // sin suavizado en el spawn: aparece directo en su altura
+  VehicleCollision3D.reset();
 
   carState.lat = SPAWN_LAT;
   carState.lng = SPAWN_LON;
