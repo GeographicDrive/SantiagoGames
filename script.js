@@ -1079,7 +1079,7 @@ function updateCarPhysics(dt){
   // En modo volador (DeLorean) se omite a propósito: volar por encima de
   // los edificios es justamente el punto de ese modo.
   if (!flyMode){
-    VehicleCollision3D.resolveMovement(prevLat, prevLng, GroundContact.getHeight());
+    VehicleCollision3D.resolveMovement(prevLat, prevLng);
   }
 }
 
@@ -1395,164 +1395,141 @@ const GroundContact = (() => {
  * 2) VehicleCollision3D — colisión física del vehículo contra geometría
  *    3D (edificios/objetos de los 3D Tiles u otros primitives). Antes no
  *    existía ningún chequeo de este tipo: el auto podía atravesar
- *    edificios libremente. Usa scene.drillPickFromRay (intersección real
- *    contra la geometría, no contra el framebuffer) sobre la trayectoria
- *    que el auto está a punto de recorrer este frame, y si detecta un
- *    obstáculo más cerca que la distancia a mover, recorta el movimiento
- *    hasta justo antes del obstáculo (con un pequeño margen/"skin") y
- *    frena la velocidad en vez de dejar que seguir empujando produzca
- *    vibración o que el auto quede clavado en seco.
+ *    edificios libremente.
+ *
+ * IMPORTANTE sobre rendimiento: scene.pickFromRay (y más aún
+ * drillPickFromRay, que internamente repite la operación una vez por
+ * cada impacto) no es una consulta liviana — cada llamada dispara un
+ * pase de render COMPLETO fuera de pantalla (updateEnvironment +
+ * updateAndExecuteCommands + resolveFramebuffers) dentro del propio
+ * Cesium. Llamarla una o varias veces POR FRAME (60/s) —como hacía la
+ * primera versión de este módulo— satura el hilo principal y congela el
+ * juego entero (cámara incluida) en un celular; no es un bug puntual del
+ * rayo, es simplemente que esa API nunca fue pensada para usarse a ese
+ * ritmo. La solución: UN solo pick (no drill) y con su propio timer
+ * independiente del loop de render (mismo patrón que GroundContact, que
+ * ya muestrea altura cada 400ms en vez de cada frame), bien throttleado.
+ * Entre chequeos se reutiliza el último resultado — a la cadencia usada
+ * acá (150ms) el "retraso" es imperceptible manejando de forma arcade.
  * --------------------------------------------------------------------- */
 const VehicleCollision3D = (() => {
-  // Altura del rayo de sondeo sobre el terreno: aprox. la mitad de la
-  // altura de un auto, para que detecte paragolpes/paredes reales y no
-  // pase por alto un bordillo bajo ni "vea" solo el techo.
-  const PROBE_HEIGHT_M = 0.6;
-  // Margen de seguridad entre el auto y el obstáculo detectado: evita que
-  // el modelo (que tiene volumen) quede exactamente tangente/clipeando
-  // contra la geometría.
-  const SKIN_MARGIN_M = 0.6;
-  // Piso del largo de sondeo: aunque el auto se mueva muy poco este
-  // frame (casi detenido), igual conviene mirar un poco más adelante
-  // para no reaccionar tarde a un obstáculo inminente al acelerar.
-  const MIN_PROBE_M = 1.2;
-  // No repetir el raycast si el auto se movió menos que esto desde el
-  // último chequeo Y sigue del mismo lado del último resultado — evita
-  // gastar un pick() por frame cuando el auto está prácticamente
-  // detenido (parado en un semáforo imaginario, menú abierto, etc).
-  const MIN_RECHECK_MOVE_M = 0.05;
+  const CHECK_INTERVAL_MS = 150; // ~6.7 chequeos/seg — nunca por frame
+  // Altura del rayo de sondeo sobre el terreno: bastante por encima del
+  // ras del piso para que, con un solo hit (sin drill), la propia calle
+  // no lo intercepte por delante salvo pendientes muy pronunciadas —a
+  // diferencia de un rayo casi al ras, que sí roza el piso.
+  const PROBE_HEIGHT_M = 1.1;
+  // Filtro de seguridad adicional (barato, sin costo de render): si aun
+  // así el hit resulta estar prácticamente al nivel del suelo, se
+  // descarta como "roce de calle" y no como obstáculo real.
+  const OBSTACLE_MIN_HEIGHT_ABOVE_GROUND_M = 0.4;
+  // Largo fijo de sondeo: cubre lo que el auto puede recorrer entre dos
+  // chequeos incluso a velocidad máxima, con margen.
+  const PROBE_DIST_M = 10;
+  // Margen de seguridad entre el auto y el obstáculo detectado.
+  const SKIN_MARGIN_M = 1.0;
+  // Ancho de "corredor" alrededor de la línea de movimiento dentro del
+  // cual un obstáculo detectado cuenta como bloqueo (si el hit quedó muy
+  // al costado, no bloquea: el auto pasa de largo).
+  const PATH_HALF_WIDTH_M = 1.5;
 
-  let lastCheckX = null, lastCheckY = null;
-  let lastBlockedDist = Infinity;
+  let obstacleX = null, obstacleY = null; // último obstáculo detectado (coords locales) o null
+  let timerId = null;
 
   const _origin = new Cesium.Cartesian3();
   const _target = new Cesium.Cartesian3();
   const _dir = new Cesium.Cartesian3();
   const _ray = new Cesium.Ray();
-
-  /**
-   * resolveMovement — dado el movimiento que updateCarPhysics ya calculó
-   * para este frame (de prevLat/prevLng a carState.lat/lng actual),
-   * verifica si ese tramo atraviesa geometría 3D y, si es así, recorta
-   * carState.lat/lng al punto justo antes del obstáculo y amortigua
-   * carState.speed. No toca nada relacionado con altura de terreno ni
-   * con calles: solo bloquea/permite el desplazamiento horizontal.
-   */
-  // Altura mínima que debe tener un impacto POR ENCIMA del suelo esperado
-  // para contar como obstáculo real (pared/edificio). Sin este filtro, el
-  // rayo casi horizontal a PROBE_HEIGHT_M roza la propia malla de la
-  // calle (los 3D Tiles fotorrealistas no son perfectamente planos) y
-  // "impacta" a ~0m en CADA frame, bloqueando el auto por completo. Un
-  // bordillo normal ronda ~0.15m; con 0.35m se ignoran esos roces del
-  // piso pero se sigue detectando cualquier pared/objeto real.
-  const OBSTACLE_MIN_HEIGHT_ABOVE_GROUND_M = 0.35;
-  // Máximo de impactos a inspeccionar por rayo (drillPick): con los
-  // primeros 2-3 alcanza para saltar impactos rasantes del piso y llegar
-  // al primer obstáculo vertical real, sin acercarse al costo de un
-  // drillPick sin límite.
-  const MAX_DRILL_HITS = 4;
-
   const _hitCarto = new Cesium.Cartographic();
 
-  function resolveMovement(prevLat, prevLng, groundHeightHint){
-    if (!viewer || !viewer.scene || typeof viewer.scene.drillPickFromRay !== "function") return;
+  /**
+   * check — el ÚNICO lugar que llama a scene.pickFromRay, con su propio
+   * setInterval (nunca desde el loop de física por frame). Lanza un rayo
+   * hacia adelante (o atrás, si el auto va en reversa) desde la posición
+   * actual y guarda el punto de impacto (si lo hay y es lo bastante alto
+   * como para ser un obstáculo real) para que resolveMovement lo use.
+   */
+  function check(){
+    if (!viewer || !viewer.scene || typeof viewer.scene.pickFromRay !== "function") return;
+    if (flyMode){ obstacleX = null; obstacleY = null; return; } // volando: sin colisión 3D, no gastar picks
+    if (Math.abs(carState.speed) < 0.5){ obstacleX = null; obstacleY = null; return; } // detenido: sin gasto de pick
 
-    const prevXY = lonLatToLocalXY(prevLng, prevLat);
-    const curXY = lonLatToLocalXY(carState.lng, carState.lat);
-    let dx = curXY.x - prevXY.x, dy = curXY.y - prevXY.y;
-    const moveDist = Math.hypot(dx, dy);
-    if (moveDist < 1e-5) { lastBlockedDist = Infinity; return; } // sin movimiento este frame: nada que chequear
+    const hdgRad = Cesium.Math.toRadians(carState.heading);
+    const sign = carState.speed >= 0 ? 1 : -1;
+    const dirX = Math.sin(hdgRad) * sign, dirY = Math.cos(hdgRad) * sign;
 
-    const dirX = dx / moveDist, dirY = dy / moveDist;
-
-    // Throttle: si el auto casi no se movió desde el último chequeo Y la
-    // dirección es prácticamente la misma, reutiliza el resultado
-    // anterior en vez de volver a llamar al raycast.
-    if (lastCheckX !== null){
-      const sinceLast = Math.hypot(curXY.x - lastCheckX, curXY.y - lastCheckY);
-      if (sinceLast < MIN_RECHECK_MOVE_M && lastBlockedDist < Infinity){
-        applyClamp(prevXY, dirX, dirY, moveDist, lastBlockedDist);
-        return;
-      }
-    }
-
-    const probeDist = Math.max(MIN_PROBE_M, moveDist + SKIN_MARGIN_M);
-    const baseGround = groundHeightHint ?? 0;
+    const { x: carX, y: carY } = lonLatToLocalXY(carState.lng, carState.lat);
+    const baseGround = GroundContact.getHeight();
     const baseHeight = baseGround + PROBE_HEIGHT_M;
+    const targetLL = localXYToLonLat(carX + dirX * PROBE_DIST_M, carY + dirY * PROBE_DIST_M);
 
-    const originLL = { lon: prevLng, lat: prevLat };
-    const targetLocal = { x: prevXY.x + dirX * probeDist, y: prevXY.y + dirY * probeDist };
-    const targetLL = localXYToLonLat(targetLocal.x, targetLocal.y);
-
-    Cesium.Cartesian3.fromDegrees(originLL.lon, originLL.lat, baseHeight, _origin);
+    Cesium.Cartesian3.fromDegrees(carState.lng, carState.lat, baseHeight, _origin);
     Cesium.Cartesian3.fromDegrees(targetLL.lon, targetLL.lat, baseHeight, _target);
     Cesium.Cartesian3.subtract(_target, _origin, _dir);
     const dirLen = Cesium.Cartesian3.magnitude(_dir);
-    if (dirLen < 1e-6) { lastBlockedDist = Infinity; return; }
+    if (dirLen < 1e-6) return;
     Cesium.Cartesian3.divideByScalar(_dir, dirLen, _dir);
     _ray.origin = _origin;
     _ray.direction = _dir;
 
-    let results = null;
+    let result = null;
     try {
-      // drillPick (no pick simple): un solo hit no alcanza porque el
-      // primero suele ser el propio piso/calle a distancia casi 0; se
-      // necesitan varios para descartar esos roces y encontrar, si
-      // existe, el primer impacto que sea realmente más alto que el
-      // suelo (pared/edificio).
-      results = viewer.scene.drillPickFromRay(_ray, MAX_DRILL_HITS, audiEntity ? [audiEntity] : []);
-    } catch (e) { results = null; } // p.ej. tileset todavía sin cargar cerca: sin bloqueo este frame
+      result = viewer.scene.pickFromRay(_ray, audiEntity ? [audiEntity] : []); // UN solo pick, no drill
+    } catch (e) { result = null; } // p.ej. tileset todavía sin cargar cerca: sin bloqueo este ciclo
 
-    lastCheckX = curXY.x; lastCheckY = curXY.y;
-
-    let obstacleDist = Infinity;
-    if (results && results.length){
-      for (let i = 0; i < results.length; i++){
-        const pos = results[i] && results[i].position;
-        if (!pos) continue;
-        Cesium.Cartographic.fromCartesian(pos, Cesium.Ellipsoid.WGS84, _hitCarto);
-        const heightAboveGround = _hitCarto.height - baseGround;
-        if (heightAboveGround >= OBSTACLE_MIN_HEIGHT_ABOVE_GROUND_M){
-          obstacleDist = Cesium.Cartesian3.distance(_origin, pos);
-          break; // el más cercano que califica como obstáculo real
-        }
-        // si no califica (roce de piso/bordillo bajo), se sigue con el
-        // próximo impacto más lejano del mismo rayo
+    if (result && result.position){
+      Cesium.Cartographic.fromCartesian(result.position, Cesium.Ellipsoid.WGS84, _hitCarto);
+      if (_hitCarto.height - baseGround >= OBSTACLE_MIN_HEIGHT_ABOVE_GROUND_M){
+        const hitXY = lonLatToLocalXY(
+          Cesium.Math.toDegrees(_hitCarto.longitude), Cesium.Math.toDegrees(_hitCarto.latitude)
+        );
+        obstacleX = hitXY.x; obstacleY = hitXY.y;
+        return;
       }
     }
-
-    if (obstacleDist < Infinity){
-      lastBlockedDist = Math.max(0, obstacleDist - SKIN_MARGIN_M);
-      applyClamp(prevXY, dirX, dirY, moveDist, lastBlockedDist);
-    } else {
-      lastBlockedDist = Infinity; // camino libre por delante del probe
-    }
+    obstacleX = null; obstacleY = null; // camino libre (o roce de piso descartado)
   }
 
-  function applyClamp(prevXY, dirX, dirY, moveDist, allowedDist){
-    if (allowedDist >= moveDist) return; // el obstáculo está más allá de donde el auto iba a llegar: sin recorte
-    const clampedDist = Math.max(0, allowedDist);
-    const newX = prevXY.x + dirX * clampedDist;
-    const newY = prevXY.y + dirY * clampedDist;
-    const clampedLL = localXYToLonLat(newX, newY);
+  /**
+   * resolveMovement — llamado cada frame de física (barato: solo
+   * aritmética contra el último obstáculo detectado por check(), sin
+   * volver a tocar la escena). Si el tramo que el auto acaba de recorrer
+   * este frame se mete en el "corredor" hacia el último obstáculo
+   * conocido, recorta carState.lat/lng justo antes y amortigua la
+   * velocidad.
+   */
+  function resolveMovement(prevLat, prevLng){
+    if (obstacleX === null) return;
+    const prevXY = lonLatToLocalXY(prevLng, prevLat);
+    const curXY = lonLatToLocalXY(carState.lng, carState.lat);
+    const dx = curXY.x - prevXY.x, dy = curXY.y - prevXY.y;
+    const moveDist = Math.hypot(dx, dy);
+    if (moveDist < 1e-6) return;
+    const dirX = dx / moveDist, dirY = dy / moveDist;
+
+    const toObsX = obstacleX - prevXY.x, toObsY = obstacleY - prevXY.y;
+    const along = toObsX * dirX + toObsY * dirY;
+    if (along <= 0) return; // el obstáculo quedó atrás: ya se lo pasó/esquivó
+    const perpDist = Math.abs(toObsX * dirY - toObsY * dirX);
+    if (perpDist > PATH_HALF_WIDTH_M) return; // está al costado, no en el camino
+
+    const allowedDist = Math.max(0, along - SKIN_MARGIN_M);
+    if (allowedDist >= moveDist) return; // sin recorte: el obstáculo está más allá de donde se iba a llegar
+
+    const newXY = { x: prevXY.x + dirX * allowedDist, y: prevXY.y + dirY * allowedDist };
+    const clampedLL = localXYToLonLat(newXY.x, newXY.y);
     carState.lat = clampedLL.lat;
     carState.lng = clampedLL.lon;
-    // Frena en vez de dejar que el input siga empujando contra la pared:
-    // si casi no quedaba distancia libre, corta la velocidad a 0; si
-    // quedaba algo, la amortigua para una respuesta menos brusca/más
-    // estable en vez de un tope en seco.
-    if (clampedDist < 0.15){
-      carState.speed = 0;
-    } else {
-      carState.speed *= 0.4;
-    }
+    // Frena en vez de dejar que el input siga empujando contra la pared.
+    if (allowedDist < 0.15) carState.speed = 0;
+    else carState.speed *= 0.4;
   }
 
-  function reset(){
-    lastCheckX = null; lastCheckY = null; lastBlockedDist = Infinity;
-  }
+  function reset(){ obstacleX = null; obstacleY = null; }
+  function start(){ if (timerId === null) timerId = setInterval(check, CHECK_INTERVAL_MS); }
+  function stop(){ if (timerId !== null){ clearInterval(timerId); timerId = null; } }
 
-  return { resolveMovement, reset };
+  return { resolveMovement, reset, start, stop };
 })();
 
 function carAnimationLoop(timestampMs){
@@ -1600,6 +1577,7 @@ function startCarLoop(){
   carAnimFrameId = requestAnimationFrame(carAnimationLoop);
   GroundContact.start();
   VehicleCollision3D.reset();
+  VehicleCollision3D.start();
   if (_navMapTimerId === null){
     _navMapTimerId = setInterval(updateNavMap, NAV_MAP_UPDATE_INTERVAL_MS);
   }
@@ -1611,6 +1589,7 @@ function stopCarLoop(){
     carAnimFrameId = null;
   }
   GroundContact.stop();
+  VehicleCollision3D.stop();
   if (_navMapTimerId !== null){
     clearInterval(_navMapTimerId);
     _navMapTimerId = null;
